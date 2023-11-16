@@ -218,7 +218,7 @@ impl Torrent {
     }
 
     /// Spawn an event loop for each peer
-    #[tracing::instrument(skip_all, name = "torrent::start_outbound_peers")]
+    #[tracing::instrument(skip_all, name = "torrent::spawn_outbound_peers")]
     pub async fn spawn_outbound_peers(
         &self,
         peers: Vec<SocketAddr>,

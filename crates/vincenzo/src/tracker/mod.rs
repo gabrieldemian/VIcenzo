@@ -428,11 +428,14 @@ impl Tracker {
             }
         }
     }
-    /// Peer ids should be prefixed with "vcz".
+    /// Because of the BEP 20,
+    /// Peer ids should be prefixed with "-VZ" + version of 4 numbers, major
+    /// (1), minor (2), and patch (1) + "-"
+    /// https://www.bittorrent.org/beps/bep_0020.html#theory
     pub fn gen_peer_id() -> [u8; 20] {
         let mut peer_id = [0; 20];
-        peer_id[..3].copy_from_slice(b"vcz");
-        peer_id[3..].copy_from_slice(&rand::random::<[u8; 17]>());
+        peer_id[..8].copy_from_slice(b"-VZ0003-");
+        peer_id[8..].copy_from_slice(&rand::random::<[u8; 12]>());
         peer_id
     }
 }
@@ -446,7 +449,7 @@ mod tests {
         // Poor man's fuzzing.
         let peer_id = Tracker::gen_peer_id();
         for _ in 0..10 {
-            assert!(peer_id.starts_with(&[b'v', b'c', b'z']));
+            assert!(peer_id.starts_with(&[b'-', b'V', b'Z']));
         }
     }
 }
