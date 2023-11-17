@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::{
-    daemon_wire::{DaemonCodec, Message}, disk::{Disk, DiskMsg}, error::Error, magnet::Magnet, torrent::{Torrent, TorrentMsg, TorrentState, TorrentStatus}, utils::to_human_readable
+    daemon_wire::{DaemonCodec, Message}, disk::{Disk, DiskMsg}, error::Error, magnet::Magnet, torrent::{Torrent, TorrentCtx, TorrentMsg, TorrentState, TorrentStatus}, utils::to_human_readable
 };
 use clap::Parser;
 
@@ -60,8 +60,6 @@ pub struct Daemon {
     pub config: DaemonConfig,
     pub disk_tx: Option<mpsc::Sender<DiskMsg>>,
     pub ctx: Arc<DaemonCtx>,
-    /// key: info_hash
-    pub torrent_txs: HashMap<[u8; 20], mpsc::Sender<TorrentMsg>>,
     rx: mpsc::Receiver<DaemonMsg>,
 }
 
@@ -71,6 +69,8 @@ pub struct DaemonCtx {
     /// key: info_hash
     /// States of all Torrents, updated each second by the Torrent struct.
     pub torrent_states: RwLock<HashMap<[u8; 20], TorrentState>>,
+    /// key: info_hash
+    pub torrent_ctxs: RwLock<HashMap<[u8; 20], Arc<TorrentCtx>>>,
 }
 
 /// Configuration of the [`Daemon`], the values here are
@@ -92,7 +92,8 @@ pub struct DaemonConfig {
 pub enum DaemonMsg {
     /// Tell Daemon to add a new torrent and it will immediately
     /// announce to a tracker, connect to the peers, and start the download.
-    NewTorrent(Magnet),
+    AddTorrent(Magnet),
+    AddTorrentWithPeers(Magnet, Vec<SocketAddr>),
     /// Message that the Daemon will send to all connectors when the state
     /// of a torrent updates (every 1 second).
     TorrentState(TorrentState),
@@ -105,6 +106,7 @@ pub enum DaemonMsg {
     Quit,
     /// Print the status of all Torrents to stdout
     PrintTorrentStatus,
+    MutateTorrent([u8; 20], Arc<TorrentCtx>),
 }
 
 impl Daemon {
@@ -125,9 +127,9 @@ impl Daemon {
             rx,
             disk_tx: None,
             config: daemon_config,
-            torrent_txs: HashMap::new(),
             ctx: Arc::new(DaemonCtx {
                 tx,
+                torrent_ctxs: RwLock::new(HashMap::new()),
                 torrent_states: RwLock::new(HashMap::new()),
             }),
         }
@@ -168,7 +170,7 @@ impl Daemon {
             loop {
                 match socket.accept().await {
                     Ok((socket, addr)) => {
-                        info!("Connected with remote: {addr}");
+                        info!("connected with remote: {addr}");
 
                         let ctx = ctx.clone();
 
@@ -178,7 +180,7 @@ impl Daemon {
                         });
                     }
                     Err(e) => {
-                        error!("Could not connect with remote: {e:#?}");
+                        error!("could not connect with remote: {e:#?}");
                     }
                 }
             }
@@ -202,10 +204,16 @@ impl Daemon {
 
                             drop(torrent_states);
                         }
-                        DaemonMsg::NewTorrent(magnet) => {
-                            let _ = self.new_torrent(magnet).await;
-                            // todo: how to imemdiately draw?
-                            // Self::draw(&mut sink).await?;
+                        DaemonMsg::AddTorrent(magnet) => {
+                            let _ = self.add_torrent(magnet, None).await;
+                        }
+                        DaemonMsg::AddTorrentWithPeers(magnet, peers) => {
+                            let _ = self.add_torrent(magnet, Some(peers)).await;
+                        }
+                        DaemonMsg::MutateTorrent(info_hash, ctx) => {
+                            let mut ctxs = self.ctx.torrent_ctxs.write().await;
+                            let local_ctx = ctxs.get_mut(&info_hash).unwrap();
+                            *local_ctx = ctx;
                         }
                         DaemonMsg::TogglePause(info_hash) => {
                             let _ = self.toggle_pause(info_hash).await;
@@ -278,7 +286,7 @@ impl Daemon {
                             trace!("daemon received NewTorrent {magnet_link}");
                             let magnet = Magnet::new(&magnet_link);
                             if let Ok(magnet) = magnet {
-                                let _ = ctx.tx.send(DaemonMsg::NewTorrent(magnet)).await;
+                                let _ = ctx.tx.send(DaemonMsg::AddTorrent(magnet)).await;
                             }
                         }
                         Message::RequestTorrentState(info_hash) => {
@@ -315,12 +323,12 @@ impl Daemon {
 
     /// Pause/resume the torrent, making the download an upload stale.
     pub async fn toggle_pause(&self, info_hash: [u8; 20]) -> Result<(), Error> {
-        let tx = self
-            .torrent_txs
+        let ctxs = self.ctx.torrent_ctxs.read().await;
+        let ctx = ctxs
             .get(&info_hash)
             .ok_or(Error::TorrentDoesNotExist)?;
 
-        tx.send(TorrentMsg::TogglePause).await?;
+        ctx.tx.send(TorrentMsg::TogglePause).await?;
 
         Ok(())
     }
@@ -353,7 +361,11 @@ impl Daemon {
     /// # Panic
     ///
     /// This fn will panic if it is being called BEFORE run
-    pub async fn new_torrent(&mut self, magnet: Magnet) -> Result<(), Error> {
+    pub async fn add_torrent(
+        &mut self,
+        magnet: Magnet,
+        peers: Option<Vec<SocketAddr>>,
+    ) -> Result<(), Error> {
         trace!("magnet: {}", *magnet);
         let info_hash = magnet.parse_xt();
 
@@ -378,11 +390,16 @@ impl Daemon {
         let disk_tx = self.disk_tx.clone().unwrap();
         let mut torrent = Torrent::new(disk_tx, self.ctx.tx.clone(), magnet);
 
-        self.torrent_txs.insert(info_hash, torrent.ctx.tx.clone());
+        let mut ctxs = self.ctx.torrent_ctxs.write().await;
+        ctxs.insert(info_hash, torrent.ctx.clone());
         info!("Downloading torrent: {}", torrent.name);
 
         spawn(async move {
-            torrent.start_and_run(None).await?;
+            if let Some(peers) = peers {
+                torrent.start_and_run_with_peers(peers).await?;
+            } else {
+                torrent.start_and_run(None).await?;
+            }
             Ok::<(), Error>(())
         });
 
@@ -392,12 +409,16 @@ impl Daemon {
     async fn quit(&mut self) -> Result<(), Error> {
         // tell all torrents that we are gracefully shutting down,
         // each torrent will kill their peers tasks, and their tracker task
-        for (_, tx) in std::mem::take(&mut self.torrent_txs) {
+        let ctxs = self.ctx.torrent_ctxs.read().await.clone();
+
+        for ctx in ctxs {
             spawn(async move {
-                let _ = tx.send(TorrentMsg::Quit).await;
+                let _ = ctx.1.tx.send(TorrentMsg::Quit).await;
             });
         }
+
         let _ = self.disk_tx.as_ref().unwrap().send(DiskMsg::Quit).await;
+
         Ok(())
     }
 }

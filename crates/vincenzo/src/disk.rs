@@ -11,7 +11,7 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::{
-    error::Error, metainfo, peer::{PeerCtx, PeerMsg}, tcp_wire::{Block, BlockInfo}, torrent::{TorrentCtx, TorrentMsg}
+    error::Error, metainfo, peer::PeerCtx, tcp_wire::{Block, BlockInfo}, torrent::{TorrentCtx, TorrentMsg}
 };
 
 #[derive(Debug)]
@@ -313,7 +313,6 @@ impl Disk {
         // each index of Vec is a piece index, that is a VecDeque of blocks
         let mut pieces_blocks: Vec<VecDeque<BlockInfo>> =
             Vec::with_capacity(r.len());
-        debug!("self.pieces {:?}", r);
         self.pieces.insert(info_hash, r);
 
         let cache_vec = vec![Vec::new(); pieces_len as usize];
@@ -336,13 +335,6 @@ impl Disk {
         }
         self.pieces_blocks.insert(info_hash, pieces_blocks);
         self.downloaded_pieces_len.insert(info_hash, 0);
-
-        // tell all peers that the Info is downloaded, and
-        // everything is ready to start the download.
-        for peer in &self.peer_ctxs {
-            peer.1.tx.send(PeerMsg::HaveInfo).await?;
-        }
-
         Ok(())
     }
 

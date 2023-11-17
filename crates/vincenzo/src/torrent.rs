@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap, net::SocketAddr, sync::{atomic::AtomicBool, Arc}, time::Duration
 };
 use tokio::{
-    net::{TcpListener, TcpStream}, select, spawn, sync::{mpsc, oneshot, RwLock}, time::{interval, interval_at, Instant}
+    net::{TcpListener, TcpStream}, select, spawn, sync::{mpsc, oneshot, RwLock}, time::{interval, interval_at, timeout, Instant}
 };
 use tracing::{debug, info, warn};
 
@@ -89,6 +89,18 @@ pub struct Torrent {
     /// this is a cache of ctx.info.get_size()
     pub size: u64,
     pub name: String,
+    active_peers_count: u8,
+}
+
+/// Context of [`Torrent`] that can be shared between other types
+#[derive(Debug)]
+pub struct TorrentCtx {
+    pub disk_tx: mpsc::Sender<DiskMsg>,
+    pub tx: mpsc::Sender<TorrentMsg>,
+    pub magnet: Magnet,
+    pub info_hash: [u8; 20],
+    pub bitfield: RwLock<Bitfield>,
+    pub info: RwLock<Info>,
 }
 
 /// State of a [`Torrent`], used by the UI to present data.
@@ -104,18 +116,6 @@ pub struct TorrentState {
     pub info_hash: [u8; 20],
 }
 
-/// Context of [`Torrent`] that can be shared between other types
-#[derive(Debug)]
-pub struct TorrentCtx {
-    pub disk_tx: mpsc::Sender<DiskMsg>,
-    pub tx: mpsc::Sender<TorrentMsg>,
-    pub magnet: Magnet,
-    pub info_hash: [u8; 20],
-    pub bitfield: RwLock<Bitfield>,
-    pub info: RwLock<Info>,
-    pub has_at_least_one_piece: AtomicBool,
-}
-
 /// Status of the current Torrent, updated at every announce request.
 #[derive(Clone, Debug, PartialEq, Default, Readable, Writable)]
 pub struct Stats {
@@ -125,6 +125,8 @@ pub struct Stats {
 }
 
 impl Torrent {
+    const MAX_ACTIVE_PEERS_LEN: u8 = 10;
+
     #[tracing::instrument(skip(disk_tx, daemon_tx), name = "torrent::new")]
     pub fn new(
         disk_tx: mpsc::Sender<DiskMsg>,
@@ -146,11 +148,11 @@ impl Torrent {
             bitfield,
             magnet,
             info,
-            has_at_least_one_piece: AtomicBool::new(false),
         });
 
         Self {
             name,
+            active_peers_count: 0,
             size: 0,
             last_second_downloaded: 0,
             download_rate: 0,
@@ -169,8 +171,9 @@ impl Torrent {
         }
     }
 
-    /// Start the Torrent, by sending `connect` and `announce_exchange`
-    /// messages to one of the trackers, and returning a list of peers.
+    /// Start the Torrent and run the tracker, by sending `connect` and
+    /// `announce_exchange` messages to one of the trackers, and returning a
+    /// list of peers.
     #[tracing::instrument(skip(self), name = "torrent::start")]
     pub async fn start(
         &mut self,
@@ -202,55 +205,75 @@ impl Torrent {
         Ok(peers)
     }
 
-    /// Start the Torrent and immediately spawns all the event loops.
-    #[tracing::instrument(skip(self), name = "torrent::start_and_run")]
+    /// Start the Torrent, run its Tracker,
+    /// and spawns all the event loops.
     pub async fn start_and_run(
         &mut self,
         listen: Option<SocketAddr>,
     ) -> Result<(), Error> {
         let peers = self.start(listen).await?;
-
         self.spawn_outbound_peers(peers).await?;
         self.spawn_inbound_peers().await?;
         self.run().await?;
+        Ok(())
+    }
 
+    /// Start the Torrent with the given peers,
+    /// and spawns all the event loops.
+    pub async fn start_and_run_with_peers(
+        &mut self,
+        peers: Vec<SocketAddr>,
+    ) -> Result<(), Error> {
+        // let peers = self.start(listen).await?;
+        self.spawn_outbound_peers(peers).await?;
+        self.spawn_inbound_peers().await?;
+        self.run().await?;
         Ok(())
     }
 
     /// Spawn an event loop for each peer
-    #[tracing::instrument(skip_all, name = "torrent::spawn_outbound_peers")]
+    #[tracing::instrument(skip_all)]
     pub async fn spawn_outbound_peers(
-        &self,
+        &mut self,
         peers: Vec<SocketAddr>,
     ) -> Result<(), Error> {
+        debug!("peers_len: {}", peers.len());
+
         for peer in peers {
+            if self.active_peers_count >= Self::MAX_ACTIVE_PEERS_LEN {
+                return Ok(());
+            }
             let ctx = self.ctx.clone();
             let local_peer_id = self.tracker_ctx.peer_id;
+            let tcp_fut = TcpStream::connect(peer);
 
             // send connections too other peers
-            spawn(async move {
-                match TcpStream::connect(peer).await {
+            // spawn(async move {
+            if let Ok(r) = timeout(Duration::from_secs(2), tcp_fut).await {
+                match r {
                     Ok(socket) => {
-                        Self::start_and_run_peer(
-                            ctx,
-                            socket,
-                            local_peer_id,
-                            Direction::Outbound,
-                        )
-                        .await?;
+                        spawn(async move {
+                            Self::start_and_run_peer(
+                                ctx,
+                                socket,
+                                local_peer_id,
+                                Direction::Outbound,
+                            )
+                            .await?;
+                            Ok::<(), Error>(())
+                        });
                     }
                     Err(e) => {
                         debug!("error with peer: {:?} {e:#?}", peer);
                         ctx.tx.send(TorrentMsg::FailedPeer(peer)).await?;
                     }
                 }
-                Ok::<(), Error>(())
-            });
+            }
         }
+        // }
         Ok(())
     }
 
-    #[tracing::instrument(skip_all, name = "torrent::start_and_run_peer")]
     async fn start_and_run_peer(
         ctx: Arc<TorrentCtx>,
         socket: TcpStream,
@@ -265,15 +288,7 @@ impl Torrent {
         let remote = socket.get_ref().peer_addr()?;
 
         let mut peer = Peer::new(remote, ctx, handshake, local);
-
         let r = peer.run(direction, socket).await;
-
-        if let Err(r) = r {
-            debug!(
-                "{} Peer session stopped due to an error: {}",
-                peer.ctx.local_addr, r
-            );
-        }
         // if we are gracefully shutting down, we do nothing with the pending
         // blocks, Rust will drop them when their scope ends naturally.
         // otherwise, we send the blocks back to the torrent
@@ -282,6 +297,14 @@ impl Torrent {
         // that we wish to end the connection.
         if peer.session.state.connection != ConnectionState::Quitting {
             peer.free_pending_blocks().await;
+        }
+
+        if let Err(r) = r {
+            debug!(
+                "{} peer session stopped due to an error: {}",
+                peer.ctx.remote_addr, r
+            );
+            return Err(r);
         }
 
         Ok(peer)
@@ -348,25 +371,28 @@ impl Torrent {
                 Some(msg) = self.rx.recv() => {
                     match msg {
                         TorrentMsg::DownloadedPiece(piece) => {
-                            self.ctx.has_at_least_one_piece.store(
-                                true,
-                                std::sync::atomic::Ordering::Relaxed
-                            );
                             // send Have messages to peers that dont have our pieces
                             for peer in self.peer_ctxs.values() {
                                 let _ = peer.tx.send(PeerMsg::HavePiece(piece)).await;
                             }
                         }
                         TorrentMsg::PeerConnected(id, ctx) => {
-                            debug!("{} connected with {}", ctx.local_addr, ctx.remote_addr);
-
                             self.peer_ctxs.insert(id, ctx.clone());
+                            self.active_peers_count += 1;
 
                             let _ = self
                                 .ctx
                                 .disk_tx
                                 .send(DiskMsg::NewPeer(ctx))
                                 .await;
+
+                            let ctx = self.peer_ctxs.get(&id).unwrap();
+                            if self.have_info {
+                                ctx.tx.send(PeerMsg::HaveInfo).await?;
+                            }
+
+                            let id = String::from_utf8_lossy(&id);
+                            debug!("connected with peer of id {id:?} have_info? {}", self.have_info);
                         }
                         TorrentMsg::DownloadComplete => {
                             info!("Downloaded torrent {:?}", self.name);
@@ -435,7 +461,7 @@ impl Torrent {
 
                             let have_all_pieces = info_len as u32 >= total;
 
-                            if have_all_pieces {
+                            if have_all_pieces && !self.have_info {
                                 // info has a valid bencode format
                                 let info_bytes = self.info_pieces.values().fold(Vec::new(), |mut acc, b| {
                                     acc.extend_from_slice(b);
@@ -487,6 +513,13 @@ impl Torrent {
 
                                     self.status = TorrentStatus::Downloading;
                                     self.ctx.disk_tx.send(DiskMsg::NewTorrent(self.ctx.clone())).await?;
+
+                                    // tell all peers that the Info is downloaded, and
+                                    // everything is ready to start the download.
+                                    debug!("telling {} peers to have_info", self.peer_ctxs.len());
+                                    for peer in &self.peer_ctxs {
+                                        peer.1.tx.send(PeerMsg::HaveInfo).await?;
+                                    }
                                 } else {
                                     warn!("a peer sent a valid Info, but the hash does not match the hash of the provided magnet link, panicking");
                                     return Err(Error::PieceInvalid);
@@ -644,7 +677,6 @@ impl Torrent {
                     for peer in self.failed_peers.clone() {
                         let ctx = self.ctx.clone();
                         let local_peer_id = self.tracker_ctx.peer_id;
-                        debug!("reconnecting_peer {peer:?}");
 
                         if let Ok(socket) = TcpStream::connect(peer).await {
                             self.failed_peers.retain(|v| *v != peer);

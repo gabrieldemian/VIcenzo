@@ -2,6 +2,7 @@
 use bendy::{
     decoding::{self, FromBencode, Object, ResultExt}, encoding::ToBencode
 };
+use tracing::debug;
 
 use crate::error;
 
@@ -47,6 +48,10 @@ impl Extension {
 pub struct M {
     pub ut_metadata: Option<u8>,
     pub ut_pex: Option<u8>,
+    // pub lt_donthave: Option<u8>,
+    // pub share_mode: Option<u8>,
+    // pub upload_only: Option<u8>,
+    // pub ut_holepunch: Option<u8>,
 }
 
 /// Metadata message used by Metadata Extension protocol (BEP 9)
@@ -152,7 +157,7 @@ impl ToBencode for Metadata {
 }
 
 impl ToBencode for M {
-    const MAX_DEPTH: usize = 20;
+    const MAX_DEPTH: usize = 5;
     fn encode(
         &self,
         encoder: bendy::encoding::SingleItemEncoder,
@@ -197,7 +202,9 @@ impl FromBencode for M {
                         .context("ut_pex")
                         .map(Some)?;
                 }
-                _ => {}
+                pair => {
+                    debug!("other_pair {}", String::from_utf8_lossy(pair.0),);
+                }
             }
         }
         Ok(Self { ut_metadata, ut_pex })
@@ -205,7 +212,7 @@ impl FromBencode for M {
 }
 
 impl ToBencode for Extension {
-    const MAX_DEPTH: usize = 20;
+    const MAX_DEPTH: usize = 5;
     fn encode(
         &self,
         encoder: bendy::encoding::SingleItemEncoder,

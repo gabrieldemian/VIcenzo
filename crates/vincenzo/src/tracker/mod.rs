@@ -337,7 +337,6 @@ impl Tracker {
             peer_list.push((ip, port).into());
         }
 
-        debug!("ips of peers addrs {peer_list:#?}");
         let peers: Vec<SocketAddr> = peer_list.into_iter().collect();
 
         Ok(peers)

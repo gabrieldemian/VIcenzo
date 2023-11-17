@@ -79,6 +79,7 @@ Options:
 - [BEP 0009](http://www.bittorrent.org/beps/bep_0009.html) - Extension for Peers to Send Metadata Files
 - [BEP 0010](http://www.bittorrent.org/beps/bep_0010.html) - Extension Protocol
 - [BEP 0015](http://www.bittorrent.org/beps/bep_0015.html) - UDP Tracker Protocol
+- [BEP 0020](https://www.bittorrent.org/beps/bep_0020.html) - Peer ID Conventions
 - [BEP 0023](http://www.bittorrent.org/beps/bep_0023.html) - Tracker Returns Compact Peer Lists
 
 ## Roadmap
