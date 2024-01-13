@@ -1,13 +1,12 @@
 use clap::Parser;
-use tokio::{runtime::Runtime, spawn, sync::mpsc};
+use tokio::{runtime::Runtime, spawn};
 use tracing::{debug, Level};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt::time::OffsetTime, FmtSubscriber};
+use vcz_ui::{action::Action, app::App};
 use vincenzo::{
     config::Config, daemon::{Args, Daemon}, error::Error
 };
-
-use vcz_ui::{UIMsg, UI};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -44,9 +43,9 @@ async fn main() -> Result<(), Error> {
     let config = Config::load().await.unwrap();
 
     let download_dir = args.download_dir.unwrap_or(config.download_dir.clone());
-    let daemon_addr = args.daemon_addr.unwrap_or(
-        config.daemon_addr.unwrap_or("127.0.0.1:3030".parse().unwrap()),
-    );
+    let daemon_addr = args
+        .daemon_addr
+        .unwrap_or(config.daemon_addr.unwrap_or(Daemon::DEFAULT_LISTENER));
 
     let mut daemon = Daemon::new(download_dir);
     daemon.config.listen = daemon_addr;
@@ -60,23 +59,23 @@ async fn main() -> Result<(), Error> {
     });
 
     // Start and run the terminal UI
-    let (fr_tx, fr_rx) = mpsc::channel::<UIMsg>(300);
-    let mut fr = UI::new(fr_tx.clone());
-
-    spawn(async move {
-        fr.run(fr_rx, daemon_addr).await.unwrap();
-        debug!("ui exited run");
-    });
+    let mut fr = App::new();
+    let fr_tx = fr.ctx.tx.clone();
 
     let args = Args::parse();
 
     // If the user passed a magnet through the CLI,
     // start this torrent immediately
     if let Some(magnet) = args.magnet {
-        fr_tx.send(UIMsg::NewTorrent(magnet)).await.unwrap();
+        fr_tx.send(Action::NewTorrent(magnet)).unwrap();
     }
 
-    handle.join().unwrap();
+    spawn(async move {
+        handle.join().unwrap();
+    });
+
+    fr.run(daemon_addr).await.unwrap();
+    debug!("ui exited run");
 
     Ok(())
 }

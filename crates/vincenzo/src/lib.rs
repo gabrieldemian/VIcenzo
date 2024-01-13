@@ -39,7 +39,7 @@
 //!        // identifier of the torrent
 //!        let info_hash = magnet.parse_xt();
 //!
-//!        tx.send(DaemonMsg::NewTorrent(magnet)).await.unwrap();
+//!        tx.send(DaemonMsg::AddTorrent(magnet)).await.unwrap();
 //!
 //!        // get information about the torrent download
 //!        let (otx, orx) = oneshot::channel();

@@ -44,6 +44,7 @@ pub enum PeerMsg {
     /// or simply does not answer at all. In both cases
     /// we need to request the block again.
     RequestBlockInfos(Vec<BlockInfo>),
+    // TryRequestBlocks,
     /// Tell this peer that we are not interested,
     /// update the local state and send a message to the peer
     NotInterested,
@@ -53,8 +54,6 @@ pub enum PeerMsg {
     /// Sends a Cancel message to cancel a metadata piece that we
     /// expect the peer to send us, because we requested it previously.
     CancelMetadata(u32),
-    /// Sent when the torrent has downloaded the entire info of the torrent.
-    HaveInfo,
     /// Sent when the torrent is paused, it makes the peer pause downloads and
     /// uploads
     Pause,
@@ -99,9 +98,6 @@ pub struct Peer {
     /// or when the peer cancels it. If a peer sends a request and cancels it
     /// before the disk read is done, the read block is dropped.
     pub incoming_requests: HashSet<BlockInfo>,
-    /// This is a cache of have_info on Torrent
-    /// to avoid using locks or atomics.
-    pub have_info: bool,
 }
 
 /// Ctx that is shared with Torrent and Disk;
@@ -218,7 +214,6 @@ impl Peer {
             outgoing_requests: HashSet::default(),
             outgoing_requests_timeout: HashMap::new(),
             session: Session::default(),
-            have_info: false,
             extension: Extension::default(),
             reserved,
             torrent_ctx,
@@ -249,7 +244,8 @@ impl Peer {
 
                 // we need to have the info downloaded in order to send the
                 // extended message, because it contains the metadata_size
-                if self.have_info {
+                let have_info = self.torrent_ctx.have_info.read().await.clone();
+                if have_info {
                     let info = self.torrent_ctx.info.read().await;
                     let metadata_size = info
                         .to_bencode()
@@ -316,7 +312,7 @@ impl Peer {
                     self.tick(&mut sink).await?;
                 }
                 // send Keepalive every 2 minutes
-                _ = keep_alive_timer.tick(), if self.have_info => {
+                _ = keep_alive_timer.tick() => {
                     sink.send(Message::KeepAlive).await?;
                 }
                 Some(Ok(msg)) = stream.next() => {
@@ -338,7 +334,8 @@ impl Peer {
 
                             // remove excess bits
                             let pieces = self.torrent_ctx.info.read().await.pieces() as usize;
-                            if bitfield.len() != pieces && pieces > 0 && self.have_info {
+                            let have_info = self.torrent_ctx.have_info.read().await.clone();
+                            if bitfield.len() != pieces && pieces > 0 && have_info {
                                 unsafe {
                                     b.set_len(pieces);
                                 }
@@ -354,12 +351,7 @@ impl Peer {
                                 self.session.state.am_interested = true;
                                 sink.send(Message::Interested).await?;
 
-                                debug!(
-                                    "{remote} interested due to Bitfield {remote} \n can_request? {}",
-                                    self.can_request()
-                                );
-
-                                if self.can_request() {
+                                if self.can_request().await {
                                     self.prepare_for_download().await;
                                     self.request_block_infos(&mut sink).await?;
                                 }
@@ -371,7 +363,7 @@ impl Peer {
                             debug!("| {remote} Unchoke  |");
                             debug!("---------------------------------");
 
-                            if self.can_request() {
+                            if self.can_request().await {
                                 self.prepare_for_download().await;
                                 self.request_block_infos(&mut sink).await?;
                             }
@@ -433,7 +425,7 @@ impl Peer {
                                         self.session.state.am_interested = true;
                                         sink.send(Message::Interested).await?;
 
-                                        if self.can_request() {
+                                        if self.can_request().await {
                                             self.prepare_for_download().await;
                                             self.request_block_infos(&mut sink).await?;
                                         }
@@ -451,7 +443,7 @@ impl Peer {
                             debug!("--");
 
                             self.handle_piece_msg(block).await?;
-                            if self.can_request() {
+                            if self.can_request().await {
                                 self.prepare_for_download().await;
                                 self.request_block_infos(&mut sink).await?;
                             }
@@ -603,7 +595,6 @@ impl Peer {
                 Some(msg) = self.rx.recv() => {
                     match msg {
                         PeerMsg::HavePiece(piece) => {
-                            self.have_info = true;
                             let pieces = self.ctx.pieces.read().await;
 
                             if let Some(b) = pieces.get(piece) {
@@ -620,7 +611,7 @@ impl Peer {
 
                             let max = self.session.target_request_queue_len as usize - self.outgoing_requests.len();
 
-                            if self.can_request() {
+                            if self.can_request().await {
                                 self.session.last_outgoing_request_time = Some(Instant::now());
 
                                 for block_info in block_infos.into_iter().take(max) {
@@ -675,7 +666,7 @@ impl Peer {
                                 self.session.state.am_interested = true;
                                 sink.send(Message::Interested).await?;
 
-                                if self.can_request() {
+                                if self.can_request().await {
                                     self.request_block_infos(&mut sink).await?;
                                 }
                             }
@@ -702,21 +693,20 @@ impl Peer {
                             self.session.state.connection = ConnectionState::Quitting;
                             return Ok(());
                         }
-                        PeerMsg::HaveInfo => {
-                            debug!("{remote} HaveInfo");
-                            self.have_info = true;
-                            let am_interested = self.session.state.am_interested;
-                            let peer_choking = self.session.state.peer_choking;
-
-                            debug!("{remote} am_interested {am_interested}");
-                            debug!("{remote} peer_choking {peer_choking}");
-
-                            if am_interested && !peer_choking {
-                                self.prepare_for_download().await;
-                                debug!("{remote} requesting blocks");
-                                self.request_block_infos(&mut sink).await?;
-                            }
-                        }
+                        // PeerMsg::TryRequestBlocks => {
+                        //     debug!("{remote} TryRequestBlocks");
+                        //     let am_interested = self.session.state.am_interested;
+                        //     let peer_choking = self.session.state.peer_choking;
+                        //
+                        //     debug!("{remote} am_interested {am_interested}");
+                        //     debug!("{remote} peer_choking {peer_choking}");
+                        //
+                        //     if am_interested && !peer_choking {
+                        //         self.prepare_for_download().await;
+                        //         debug!("{remote} requesting blocks");
+                        //         self.request_block_infos(&mut sink).await?;
+                        //     }
+                        // }
                     }
                 }
             }
@@ -729,9 +719,10 @@ impl Peer {
     /// - We have the downloaded the info of the torrent
     /// - The torrent is not fully downloaded (peer is not in seed-only mode)
     /// - The capacity of inflight blocks is not full (len of outgoing_requests)
-    pub fn can_request(&self) -> bool {
+    pub async fn can_request(&self) -> bool {
         let remote = self.ctx.remote_addr;
 
+        let have_info = self.torrent_ctx.have_info.read().await.clone();
         let am_interested = self.session.state.am_interested;
         let am_choking = self.session.state.am_choking;
         let have_capacity = self.outgoing_requests.len()
@@ -739,7 +730,7 @@ impl Peer {
 
         let result = am_interested
             && !am_choking
-            && self.have_info
+            && have_info
             && have_capacity
             && !self.session.seed_only;
 
@@ -750,8 +741,7 @@ impl Peer {
             have_info {}
             have_capacity {have_capacity}
             seed_only {} ",
-            self.have_info,
-            self.session.seed_only,
+            have_info, self.session.seed_only,
         );
 
         result
@@ -813,7 +803,7 @@ impl Peer {
     {
         // resend requests if we have any pending and more time has elapsed
         // since the last received block than the current timeout value
-        if self.can_request() {
+        if self.can_request().await {
             self.request_block_infos(sink).await?;
             self.check_request_timeout(sink).await?;
         }
@@ -1009,7 +999,8 @@ impl Peer {
     {
         // only request info if we dont have an Info
         // and the peer supports the metadata extension protocol
-        if !self.have_info {
+        let have_info = self.torrent_ctx.have_info.read().await.clone();
+        if have_info {
             // send bep09 request to get the Info
             if let Some(ut_metadata) = self.extension.m.ut_metadata {
                 debug!(

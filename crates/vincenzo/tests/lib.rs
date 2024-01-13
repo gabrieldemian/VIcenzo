@@ -64,6 +64,10 @@ pub async fn create_simple_torrent() -> () {
     let ctx = ctxs.get_mut(&info_hash).unwrap();
     let mut daemon_info = ctx.info.write().await;
 
+    let mut have_info = ctx.have_info.write().await;
+    *have_info = true;
+    drop(have_info);
+
     // pretend we already have the info,
     // that was downloaded from the magnet
     let mut torrent_bitfield = ctx.bitfield.write().await;
@@ -72,7 +76,6 @@ pub async fn create_simple_torrent() -> () {
 
     *daemon_info = info.clone();
     drop(daemon_info);
-    // torrent.size = info.get_size();
-    // torrent.have_info = true;
+
     ()
 }

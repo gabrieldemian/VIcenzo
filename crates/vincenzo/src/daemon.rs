@@ -111,7 +111,7 @@ pub enum DaemonMsg {
 
 impl Daemon {
     pub const DEFAULT_LISTENER: SocketAddr =
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3030);
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 3030);
 
     /// Initialize the Daemon struct with the default [`DaemonConfig`].
     pub fn new(download_dir: String) -> Self {
@@ -324,9 +324,7 @@ impl Daemon {
     /// Pause/resume the torrent, making the download an upload stale.
     pub async fn toggle_pause(&self, info_hash: [u8; 20]) -> Result<(), Error> {
         let ctxs = self.ctx.torrent_ctxs.read().await;
-        let ctx = ctxs
-            .get(&info_hash)
-            .ok_or(Error::TorrentDoesNotExist)?;
+        let ctx = ctxs.get(&info_hash).ok_or(Error::TorrentDoesNotExist)?;
 
         ctx.tx.send(TorrentMsg::TogglePause).await?;
 
@@ -347,7 +345,6 @@ impl Daemon {
                 .map_err(|_| Error::SendErrorTcp)?;
         }
 
-        drop(torrent_states);
         Ok(())
     }
 
