@@ -9,7 +9,7 @@ use std::{
     fmt::Debug, net::{IpAddr, Ipv4Addr, SocketAddr}, time::Duration
 };
 
-use crate::error::Error;
+use crate::{error::Error, peer::PeerId, torrent::InfoHash};
 use rand::Rng;
 use tokio::{
     net::{ToSocketAddrs, UdpSocket}, select, sync::{mpsc, oneshot}, time::timeout
@@ -54,7 +54,7 @@ impl Default for Tracker {
 pub struct TrackerCtx {
     pub tx: Option<mpsc::Sender<TrackerMsg>>,
     /// Our ID for this connected Tracker
-    pub peer_id: [u8; 20],
+    pub peer_id: PeerId,
     /// UDP Socket of the `socket` in Tracker struct
     pub tracker_addr: String,
     /// Our peer socket addr, peers will send handshakes
@@ -79,7 +79,7 @@ impl Default for TrackerCtx {
 pub enum TrackerMsg {
     Announce {
         event: Event,
-        info_hash: [u8; 20],
+        info_hash: InfoHash,
         downloaded: u64,
         uploaded: u64,
         left: u64,
@@ -97,7 +97,7 @@ impl Tracker {
     /// Bind UDP socket and send a connect handshake,
     /// to one of the trackers.
     // todo: get a new tracker if download is stale
-    #[tracing::instrument(skip(trackers), name = "tracker::connect")]
+    #[tracing::instrument(skip(trackers))]
     pub async fn connect<A>(trackers: Vec<A>) -> Result<Self, Error>
     where
         A: ToSocketAddrs
@@ -109,18 +109,15 @@ impl Tracker {
             + Clone,
         A::Iter: Send,
     {
-        debug!("...trying to connect to {:?} trackers", trackers.len());
+        debug!("trying to connect to {:?} trackers", trackers.len());
 
         // Connect to all trackers, return on the first
         // successful handshake.
         for tracker_addr in trackers {
-            debug!("trying to connect {tracker_addr:?}");
-
             let socket = match Self::new_udp_socket(tracker_addr.clone()).await
             {
                 Ok(socket) => socket,
                 Err(_) => {
-                    debug!("could not connect to tracker");
                     continue;
                 }
             };
@@ -138,7 +135,7 @@ impl Tracker {
                 peer_addr: socket.peer_addr().unwrap(),
             };
             if tracker.connect_exchange(socket).await.is_ok() {
-                debug!("announced to tracker {tracker_addr}");
+                debug!("announced to: {tracker_addr}");
                 return Ok(tracker);
             }
         }
@@ -147,7 +144,7 @@ impl Tracker {
         Err(Error::TrackerNoHosts)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     async fn connect_exchange(
         &mut self,
         socket: UdpSocket,
@@ -158,8 +155,7 @@ impl Tracker {
 
         // will try to connect up to 3 times
         // breaking if succesfull
-        for i in 0..=2 {
-            debug!("sending connect number {i}...");
+        for _i in 0..=2 {
             socket.send(&req.serialize()).await?;
 
             match timeout(Duration::new(5, 0), socket.recv(&mut buf)).await {
@@ -193,10 +189,10 @@ impl Tracker {
     }
 
     /// Attempts to send an "announce_request" to the tracker
-    #[tracing::instrument(skip(self, info_hash))]
+    #[tracing::instrument(skip_all)]
     pub async fn announce_exchange(
         &mut self,
-        info_hash: [u8; 20],
+        info_hash: InfoHash,
         listen: Option<SocketAddr>,
     ) -> Result<(announce::Response, Vec<SocketAddr>), Error> {
         let socket = UdpSocket::bind(self.local_addr).await?;
@@ -222,7 +218,7 @@ impl Tracker {
         let req = announce::Request::new(
             connection_id,
             info_hash,
-            self.ctx.peer_id,
+            self.ctx.peer_id.clone(),
             // local_peer_socket.ip() as u32,
             0,
             local_peer_socket.port(),
@@ -242,8 +238,7 @@ impl Tracker {
 
         // will try to connect up to 3 times
         // breaking if succesfull
-        for i in 0..=2 {
-            debug!("trying to send announce number {i}...");
+        for _i in 0..=2 {
             socket.send(&req.serialize()).await?;
             match timeout(Duration::new(3, 0), socket.recv(&mut res)).await {
                 Ok(Ok(lenn)) => {
@@ -273,8 +268,7 @@ impl Tracker {
             return Err(Error::TrackerResponse);
         }
 
-        debug!("* announce successful");
-        debug!("res from announce {:#?}", res);
+        debug!("announce: {:#?}", res);
 
         let peers = Self::parse_compact_peer_list(
             payload,
@@ -286,7 +280,7 @@ impl Tracker {
 
     /// Connect is the first step in getting the file
     /// Create an UDP Socket for the given tracker address
-    #[tracing::instrument(skip(addr))]
+    #[tracing::instrument(skip_all)]
     pub async fn new_udp_socket<A: ToSocketAddrs + std::fmt::Debug>(
         addr: A,
     ) -> Result<UdpSocket, Error> {
@@ -345,7 +339,7 @@ impl Tracker {
     pub async fn announce_msg(
         &self,
         event: Event,
-        info_hash: [u8; 20],
+        info_hash: InfoHash,
         downloaded: u64,
         uploaded: u64,
         left: u64,
@@ -359,7 +353,7 @@ impl Tracker {
             action: Action::Announce.into(),
             transaction_id: rand::thread_rng().gen(),
             info_hash,
-            peer_id: self.ctx.peer_id,
+            peer_id: self.ctx.peer_id.clone(),
             downloaded,
             left,
             uploaded,
@@ -397,7 +391,6 @@ impl Tracker {
 
     #[tracing::instrument(skip(self))]
     pub async fn run(&mut self) -> Result<(), Error> {
-        debug!("running tracker");
         loop {
             select! {
                 Some(msg) = self.rx.recv() => {
@@ -431,11 +424,11 @@ impl Tracker {
     /// Peer ids should be prefixed with "-VZ" + version of 4 numbers, major
     /// (1), minor (2), and patch (1) + "-"
     /// https://www.bittorrent.org/beps/bep_0020.html#theory
-    pub fn gen_peer_id() -> [u8; 20] {
+    pub fn gen_peer_id() -> PeerId {
         let mut peer_id = [0; 20];
         peer_id[..8].copy_from_slice(b"-VZ0003-");
         peer_id[8..].copy_from_slice(&rand::random::<[u8; 12]>());
-        peer_id
+        PeerId(peer_id)
     }
 }
 

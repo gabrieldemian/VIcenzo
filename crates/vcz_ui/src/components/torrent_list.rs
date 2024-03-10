@@ -4,7 +4,7 @@ use crossterm::event::KeyCode;
 use hashbrown::HashMap;
 use ratatui::{prelude::*, widgets::*};
 use vincenzo::{
-    torrent::{TorrentState, TorrentStatus}, utils::to_human_readable
+    torrent::{InfoHash, TorrentState, TorrentStatus}, utils::to_human_readable
 };
 
 use crate::{action::Action, app::AppCtx, utils::centered_rect};
@@ -16,7 +16,7 @@ use super::{
 pub struct TorrentList<'a> {
     pub focused: bool,
     pub state: ListState,
-    pub torrent_infos: HashMap<[u8; 20], TorrentState>,
+    pub torrent_infos: HashMap<InfoHash, TorrentState>,
 
     /// Used to show and hide the input popup
     show_popup: bool,
@@ -27,7 +27,7 @@ pub struct TorrentList<'a> {
     /// The torrent which is currently selected using the UI. Some keybindings
     /// will be aplied to this torrent, such as pause, resume, deletion,
     /// etc.
-    active_torrent: Option<[u8; 20]>,
+    active_torrent: Option<InfoHash>,
     ctx: Arc<AppCtx>,
 
     footer: List<'a>,
@@ -143,8 +143,9 @@ impl<'a> Component for TorrentList<'a> {
             let mut line_bottom = line_top.clone();
 
             if self.state.selected() == Some(i) {
-                line_top.patch_style(self.ctx.style.highlight_fg);
-                line_bottom.patch_style(self.ctx.style.highlight_fg);
+                line_top = line_top.patch_style(self.ctx.style.highlight_fg);
+                line_bottom =
+                    line_bottom.patch_style(self.ctx.style.highlight_fg);
             }
 
             let mut items = vec![
@@ -157,7 +158,7 @@ impl<'a> Component for TorrentList<'a> {
             ];
 
             if Some(i) == selected {
-                self.active_torrent = Some(ctx.info_hash);
+                self.active_torrent = Some(ctx.info_hash.clone());
             }
 
             if Some(i) != selected && selected > Some(0) {
@@ -229,7 +230,7 @@ impl<'a> Component for TorrentList<'a> {
             Action::TorrentState(state) => {
                 let t = self
                     .torrent_infos
-                    .entry(state.info_hash)
+                    .entry(state.info_hash.clone())
                     .or_insert(TorrentState::default());
 
                 *t = state.clone();
@@ -248,11 +249,11 @@ impl<'a> Component for TorrentList<'a> {
                     }
                 }
                 KeyCode::Char('p') => {
-                    if let Some(active_torrent) = self.active_torrent {
+                    if let Some(active_torrent) = &self.active_torrent {
                         let _ = self
                             .ctx
                             .tx
-                            .send(Action::TogglePause(active_torrent));
+                            .send(Action::TogglePause(active_torrent.clone()));
                     }
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {

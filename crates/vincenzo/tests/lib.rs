@@ -1,23 +1,35 @@
 use bitvec::{bitvec, prelude::Msb0};
 use rand::{distributions::Alphanumeric, Rng};
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::Path, sync::Arc};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, spawn};
 use vincenzo::{
-    daemon::{Daemon, DaemonMsg}, magnet::Magnet, metainfo::Info, tracker::Tracker
+    daemon::{Daemon, DaemonCtx, DaemonMsg}, magnet::Magnet, metainfo::Info, torrent::TorrentCtx, tracker::Tracker
 };
 
-pub async fn create_simple_torrent() -> () {
+/// The data returned when a fake peer is downloading/uploading a Torrent
+#[derive(Clone, Debug)]
+pub struct TorrentInfo {
+    pub daemon_ctx: Arc<DaemonCtx>,
+    pub torrent_ctx: Arc<TorrentCtx>,
+}
+
+
+/// Setup necessary boilerplate to test a Torrent,
+/// create download folder, initialize structs,
+/// but do not spawn the daemon.
+fn setup_torrent() -> (Daemon, Magnet, Info) {
     let original_hook = std::panic::take_hook();
     let mut rng = rand::thread_rng();
+
+    // name of the torrent file
     let name: String =
         (0..20).map(|_| rng.sample(Alphanumeric) as char).collect();
-    let download_dir: String =
-        (0..20).map(|_| rng.sample(Alphanumeric) as char).collect();
+    let download_dir: String = "/tmp".into();
     let info_hash = [9u8; 20];
     let info_hash_str: String = info_hash.iter().map(|_| "9").collect();
     let local_peer_id = Tracker::gen_peer_id();
-    let download_dir_2 = download_dir.clone();
 
+    let download_dir_2: String = download_dir.clone();
     std::panic::set_hook(Box::new(move |panic| {
         let _ = std::fs::remove_dir_all(&download_dir_2);
         original_hook(panic);
@@ -44,8 +56,16 @@ pub async fn create_simple_torrent() -> () {
     };
 
     let magnet = Magnet::new(&magnet).unwrap();
-    let mut daemon = Daemon::new(download_dir.clone());
+    let daemon = Daemon::new(download_dir.clone());
+
+    (daemon, magnet, info)
+}
+
+/// Create a seeder node for a torrent with a random name
+pub async fn create_seeder() -> TorrentInfo {
+    let (daemon, magnet, info) = setup_torrent();
     let daemon_ctx = daemon.ctx.clone();
+    let info_hash = magnet.parse_xt();
 
     spawn(async move {
         daemon.run().await.unwrap();
@@ -61,21 +81,25 @@ pub async fn create_simple_torrent() -> () {
         .unwrap();
 
     let mut ctxs = daemon_ctx.torrent_ctxs.write().await;
-    let ctx = ctxs.get_mut(&info_hash).unwrap();
-    let mut daemon_info = ctx.info.write().await;
+    let torrent_ctx = ctxs.get_mut(&info_hash).unwrap();
+    let mut daemon_info = torrent_ctx.info.write().await;
 
-    let mut have_info = ctx.have_info.write().await;
+    // this is a seeder, so it already has the info.
+    let mut have_info = torrent_ctx.have_info.write().await;
     *have_info = true;
     drop(have_info);
 
-    // pretend we already have the info,
-    // that was downloaded from the magnet
-    let mut torrent_bitfield = ctx.bitfield.write().await;
+    // populate the bitfield with zeroes
+    let mut torrent_bitfield = torrent_ctx.bitfield.write().await;
     *torrent_bitfield = bitvec![u8, Msb0; 0; info.pieces() as usize];
     drop(torrent_bitfield);
 
+    // pretend that daemon already has the info of the torrent
     *daemon_info = info.clone();
     drop(daemon_info);
 
-    ()
+    TorrentInfo {
+        daemon_ctx,
+        torrent_ctx: *torrent_ctx,
+    }
 }

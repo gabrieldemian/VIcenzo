@@ -12,14 +12,13 @@ use vincenzo::{
 async fn main() -> Result<(), Error> {
     let tmp = std::env::temp_dir();
     let time = std::time::SystemTime::now();
-    let timestamp =
+    let _timestamp =
         time.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
 
-    let file_appender = RollingFileAppender::new(
-        Rotation::NEVER,
-        tmp,
-        format!("vcz-{timestamp}.log"),
-    );
+    let _ = std::fs::remove_file("/tmp/vcz.log");
+
+    let file_appender =
+        RollingFileAppender::new(Rotation::NEVER, tmp, format!("vcz.log"));
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     let subscriber = FmtSubscriber::builder()

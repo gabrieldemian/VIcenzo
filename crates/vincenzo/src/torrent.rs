@@ -1,16 +1,42 @@
 //! Torrent that is spawned by the Daemon
 use crate::{
-    bitfield::Bitfield, daemon::DaemonMsg, disk::DiskMsg, error::Error, magnet::Magnet, metainfo::Info, peer::{session::ConnectionState, Direction, Peer, PeerCtx, PeerMsg}, tcp_wire::BlockInfo, tracker::{event::Event, Tracker, TrackerCtx, TrackerMsg}
+    bitfield::Bitfield, daemon::DaemonMsg, disk::DiskMsg, error::Error, magnet::Magnet, metainfo::Info, peer::{
+        session::ConnectionState, Direction, Peer, PeerCtx, PeerId, PeerMsg
+    }, tcp_wire::BlockInfo, tracker::{event::Event, Tracker, TrackerCtx, TrackerMsg}
 };
 use bendy::decoding::FromBencode;
 use bitvec::{bitvec, prelude::Msb0};
 use hashbrown::HashMap;
 use speedy::{Readable, Writable};
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, net::SocketAddr, ops::{Deref, DerefMut}, sync::Arc, time::Duration
+};
 use tokio::{
     net::{TcpListener, TcpStream}, select, spawn, sync::{mpsc, oneshot, RwLock}, time::{interval, interval_at, timeout, Instant}
 };
 use tracing::{debug, info, warn};
+
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Writable, Readable)]
+pub struct InfoHash(pub [u8; 20]);
+
+impl From<[u8; 20]> for InfoHash {
+    fn from(value: [u8; 20]) -> Self {
+        Self(value)
+    }
+}
+
+impl Deref for InfoHash {
+    type Target = [u8; 20];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for InfoHash {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[derive(Debug)]
 pub enum TorrentMsg {
@@ -18,22 +44,24 @@ pub enum TorrentMsg {
     /// an entire piece. We send Have messages to peers
     /// that don't have it and update the UI with stats.
     DownloadedPiece(usize),
-    PeerConnected([u8; 20], Arc<PeerCtx>),
+    /// The Peer will send this message if it manages to succesfully handshake
+    /// and connect.
+    PeerConnected(PeerId, Arc<PeerCtx>),
     DownloadComplete,
     /// When in endgame mode, the first peer that receives this info,
     /// sends this message to send Cancel's to all other peers.
     SendCancelBlock {
-        from: [u8; 20],
+        from: PeerId,
         block_info: BlockInfo,
     },
     /// When a peer downloads a piece of a metadata,
     /// send cancels to all other peers so that we dont receive
     /// pieces that we already have
     SendCancelMetadata {
-        from: [u8; 20],
+        from: PeerId,
         index: u32,
     },
-    StartEndgame([u8; 20], Vec<BlockInfo>),
+    StartEndgame(PeerId, Vec<BlockInfo>),
     /// When a peer downloads an info piece,
     /// we need to mutate `info_dict` and maybe
     /// generate the entire info.
@@ -59,7 +87,7 @@ pub struct Torrent {
     pub ctx: Arc<TorrentCtx>,
     pub tracker_ctx: Arc<TrackerCtx>,
     /// key: peer_id
-    pub peer_ctxs: HashMap<[u8; 20], Arc<PeerCtx>>,
+    pub peer_ctxs: HashMap<PeerId, Arc<PeerCtx>>,
     pub failed_peers: Vec<SocketAddr>,
     /// If using a Magnet link, the info will be downloaded in pieces
     /// and those pieces may come in different order,
@@ -95,7 +123,7 @@ pub struct TorrentCtx {
     pub disk_tx: mpsc::Sender<DiskMsg>,
     pub tx: mpsc::Sender<TorrentMsg>,
     pub magnet: Magnet,
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
     pub bitfield: RwLock<Bitfield>,
     pub info: RwLock<Info>,
     pub have_info: RwLock<bool>,
@@ -111,7 +139,7 @@ pub struct TorrentState {
     pub download_rate: u64,
     pub uploaded: u64,
     pub size: u64,
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
 }
 
 /// Status of the current Torrent, updated at every announce request.
@@ -179,7 +207,7 @@ impl Torrent {
     ) -> Result<Vec<SocketAddr>, Error> {
         let mut tracker =
             Tracker::connect(self.ctx.magnet.parse_trackers()).await?;
-        let info_hash = self.ctx.clone().info_hash;
+        let info_hash = self.ctx.clone().info_hash.clone();
         let (res, peers) = tracker.announce_exchange(info_hash, listen).await?;
 
         self.stats = Stats {
@@ -235,52 +263,65 @@ impl Torrent {
         &mut self,
         peers: Vec<SocketAddr>,
     ) -> Result<(), Error> {
-        debug!("peers_len: {}", peers.len());
+        debug!(
+            "there are {} peers. Will try to connect up to {}",
+            peers.len(),
+            Self::MAX_ACTIVE_PEERS_LEN
+        );
 
         for peer in peers {
             if self.active_peers_count >= Self::MAX_ACTIVE_PEERS_LEN {
                 return Ok(());
             }
             let ctx = self.ctx.clone();
-            let local_peer_id = self.tracker_ctx.peer_id;
-            let tcp_fut = TcpStream::connect(peer);
+            let local_peer_id = self.tracker_ctx.peer_id.clone();
+            let connection_fut = TcpStream::connect(peer);
 
             // send connections too other peers
-            // spawn(async move {
-            if let Ok(r) = timeout(Duration::from_secs(2), tcp_fut).await {
-                match r {
-                    Ok(socket) => {
-                        spawn(async move {
-                            Self::start_and_run_peer(
+            spawn(async move {
+                if let Ok(r) =
+                    timeout(Duration::from_secs(3), connection_fut).await
+                {
+                    match r {
+                        Ok(socket) => {
+                            info!("connected with peer: {socket:?}",);
+                            let p = Self::start_and_run_peer(
                                 ctx,
                                 socket,
                                 local_peer_id,
                                 Direction::Outbound,
                             )
                             .await?;
-                            Ok::<(), Error>(())
-                        });
-                    }
-                    Err(e) => {
-                        debug!("error with peer: {:?} {e:#?}", peer);
-                        ctx.tx.send(TorrentMsg::FailedPeer(peer)).await?;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "could not connect to peer: {:?} {}",
+                                peer,
+                                e.to_string()
+                            );
+                            ctx.tx.send(TorrentMsg::FailedPeer(peer)).await?;
+                        }
                     }
                 }
-            }
+                Ok::<(), Error>(())
+            });
         }
-        // }
         Ok(())
     }
 
     async fn start_and_run_peer(
         ctx: Arc<TorrentCtx>,
         socket: TcpStream,
-        local_peer_id: [u8; 20],
+        local_peer_id: PeerId,
         direction: Direction,
     ) -> Result<Peer, Error> {
-        let (socket, handshake) =
-            Peer::handshake(socket, direction, ctx.info_hash, local_peer_id)
-                .await?;
+        let (socket, handshake) = Peer::handshake(
+            socket,
+            direction,
+            ctx.info_hash.clone(),
+            local_peer_id,
+        )
+        .await?;
 
         let local = socket.get_ref().local_addr()?;
         let remote = socket.get_ref().peer_addr()?;
@@ -309,20 +350,22 @@ impl Torrent {
     }
 
     /// Spawn a new event loop every time a peer connect with us.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub async fn spawn_inbound_peers(&self) -> Result<(), Error> {
-        debug!("accepting requests in {:?}", self.tracker_ctx.local_peer_addr);
-
         let local_peer_socket =
             TcpListener::bind(self.tracker_ctx.local_peer_addr).await?;
-        let local_peer_id = self.tracker_ctx.peer_id;
+        let local_peer_id = self.tracker_ctx.peer_id.clone();
         let ctx = self.ctx.clone();
 
         // accept connections from other peers
         spawn(async move {
-            debug!("accepting requests in {local_peer_socket:?}");
+            debug!(
+                "accepting requests in {:?}",
+                local_peer_socket.local_addr()
+            );
 
             loop {
+                let local_peer_id = local_peer_id.clone();
                 if let Ok((socket, addr)) = local_peer_socket.accept().await {
                     info!("received inbound connection from {addr}");
                     let ctx = ctx.clone();
@@ -375,19 +418,20 @@ impl Torrent {
                             }
                         }
                         TorrentMsg::PeerConnected(id, ctx) => {
-                            self.peer_ctxs.insert(id, ctx.clone());
+                            self.peer_ctxs.insert(id.clone(), ctx.clone());
                             self.active_peers_count += 1;
 
                             let _ = self
                                 .ctx
                                 .disk_tx
-                                .send(DiskMsg::NewPeer(ctx))
+                                .send(DiskMsg::NewPeer(ctx.clone()))
                                 .await;
 
-                            let have_info = self.ctx.have_info.read().await;
+                            // let have_info = self.ctx.have_info.read().await;
 
-                            let id = String::from_utf8_lossy(&id);
-                            debug!("connected with peer of id {id:?} have_info? {}", have_info);
+                            let _ = self.daemon_tx.send(DaemonMsg::PeerConnected(id.clone(), ctx)).await;
+
+                            // debug!("connected with peer of id {:?} have_info? {}", *id.to_string(), have_info);
                         }
                         TorrentMsg::DownloadComplete => {
                             info!("Downloaded torrent {:?}", self.name);
@@ -399,7 +443,7 @@ impl Torrent {
                                 let _ = tracker_tx.send(
                                     TrackerMsg::Announce {
                                         event: Event::Completed,
-                                        info_hash: self.ctx.info_hash,
+                                        info_hash: self.ctx.info_hash.clone(),
                                         downloaded: self.downloaded,
                                         uploaded: self.uploaded,
                                         left: 0,
@@ -579,7 +623,7 @@ impl Torrent {
                                 let _ = tracker_tx.send(
                                     TrackerMsg::Announce {
                                         event: Event::Stopped,
-                                        info_hash: self.ctx.info_hash,
+                                        info_hash: self.ctx.info_hash.clone(),
                                         downloaded: self.downloaded,
                                         uploaded: self.uploaded,
                                         left,
@@ -613,7 +657,7 @@ impl Torrent {
                         stats: self.stats.clone(),
                         status: self.status.clone(),
                         download_rate: self.download_rate,
-                        info_hash: self.ctx.info_hash,
+                        info_hash: self.ctx.info_hash.clone(),
                     };
 
                     self.last_second_downloaded = self.downloaded;
@@ -644,7 +688,7 @@ impl Torrent {
                             let _ = tracker_tx.send(
                                 TrackerMsg::Announce {
                                     event: Event::None,
-                                    info_hash: self.ctx.info_hash,
+                                    info_hash: self.ctx.info_hash.clone(),
                                     downloaded: self.downloaded,
                                     uploaded: self.uploaded,
                                     left,
@@ -670,7 +714,7 @@ impl Torrent {
                 _ = reconnect_failed_peers.tick() => {
                     for peer in self.failed_peers.clone() {
                         let ctx = self.ctx.clone();
-                        let local_peer_id = self.tracker_ctx.peer_id;
+                        let local_peer_id = self.tracker_ctx.peer_id.clone();
 
                         if let Ok(socket) = TcpStream::connect(peer).await {
                             self.failed_peers.retain(|v| *v != peer);

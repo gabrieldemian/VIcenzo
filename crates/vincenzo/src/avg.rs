@@ -1,5 +1,5 @@
 //! Exponential moving average accumulator.
-use std::{convert::TryInto, time::Duration};
+use std::time::Duration;
 
 /// An algorithm is used that addresss the initial bias that occurs when all
 /// values are initialized with zero or with the first sample (which would bias

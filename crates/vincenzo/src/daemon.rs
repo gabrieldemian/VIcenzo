@@ -13,7 +13,9 @@ use tokio::{
 };
 
 use crate::{
-    daemon_wire::{DaemonCodec, Message}, disk::{Disk, DiskMsg}, error::Error, magnet::Magnet, torrent::{Torrent, TorrentCtx, TorrentMsg, TorrentState, TorrentStatus}, utils::to_human_readable
+    daemon_wire::{DaemonCodec, Message}, disk::{Disk, DiskMsg}, error::Error, magnet::Magnet, peer::{PeerCtx, PeerId}, torrent::{
+        InfoHash, Torrent, TorrentCtx, TorrentMsg, TorrentState, TorrentStatus
+    }, utils::to_human_readable
 };
 use clap::Parser;
 
@@ -68,9 +70,10 @@ pub struct DaemonCtx {
     pub tx: mpsc::Sender<DaemonMsg>,
     /// key: info_hash
     /// States of all Torrents, updated each second by the Torrent struct.
-    pub torrent_states: RwLock<HashMap<[u8; 20], TorrentState>>,
+    pub torrent_states: RwLock<HashMap<InfoHash, TorrentState>>,
     /// key: info_hash
-    pub torrent_ctxs: RwLock<HashMap<[u8; 20], Arc<TorrentCtx>>>,
+    pub torrent_ctxs: RwLock<HashMap<InfoHash, Arc<TorrentCtx>>>,
+    pub peer_ctxs: RwLock<HashMap<PeerId, Arc<PeerCtx>>>,
 }
 
 /// Configuration of the [`Daemon`], the values here are
@@ -99,19 +102,25 @@ pub enum DaemonMsg {
     TorrentState(TorrentState),
     /// Ask the Daemon to send a [`TorrentState`] of the torrent with the given
     /// hash_info.
-    RequestTorrentState([u8; 20], oneshot::Sender<Option<TorrentState>>),
+    RequestTorrentState(InfoHash, oneshot::Sender<Option<TorrentState>>),
     /// Pause/Resume a torrent.
-    TogglePause([u8; 20]),
+    TogglePause(InfoHash),
     /// Gracefully shutdown the Daemon
     Quit,
     /// Print the status of all Torrents to stdout
     PrintTorrentStatus,
-    MutateTorrent([u8; 20], Arc<TorrentCtx>),
+    MutateTorrent(InfoHash, Arc<TorrentCtx>),
+    /// When a Torrent receives this message, from the Peer,
+    /// it sends this message to Daemon to store the PeerCtx.
+    ///
+    /// This is because the PeerCtx of the Torrent is behind an Arc,
+    /// which cannot be mutated.
+    PeerConnected(PeerId, Arc<PeerCtx>),
 }
 
 impl Daemon {
     pub const DEFAULT_LISTENER: SocketAddr =
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 3030);
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3030);
 
     /// Initialize the Daemon struct with the default [`DaemonConfig`].
     pub fn new(download_dir: String) -> Self {
@@ -129,6 +138,7 @@ impl Daemon {
             config: daemon_config,
             ctx: Arc::new(DaemonCtx {
                 tx,
+                peer_ctxs: RwLock::new(HashMap::new()),
                 torrent_ctxs: RwLock::new(HashMap::new()),
                 torrent_states: RwLock::new(HashMap::new()),
             }),
@@ -193,10 +203,14 @@ impl Daemon {
             select! {
                 Some(msg) = self.rx.recv() => {
                     match msg {
+                        DaemonMsg::PeerConnected(id, ctx) => {
+                            let mut ctxs = self.ctx.peer_ctxs.write().await;
+                            ctxs.insert(id, ctx);
+                        }
                         DaemonMsg::TorrentState(torrent_state) => {
                             let mut torrent_states = self.ctx.torrent_states.write().await;
 
-                            torrent_states.insert(torrent_state.info_hash, torrent_state.clone());
+                            torrent_states.insert(torrent_state.info_hash.clone(), torrent_state);
 
                             if self.config.quit_after_complete && torrent_states.values().all(|v| v.status == TorrentStatus::Seeding) {
                                 let _ = ctx.tx.send(DaemonMsg::Quit).await;
@@ -322,7 +336,7 @@ impl Daemon {
     }
 
     /// Pause/resume the torrent, making the download an upload stale.
-    pub async fn toggle_pause(&self, info_hash: [u8; 20]) -> Result<(), Error> {
+    pub async fn toggle_pause(&self, info_hash: InfoHash) -> Result<(), Error> {
         let ctxs = self.ctx.torrent_ctxs.read().await;
         let ctx = ctxs.get(&info_hash).ok_or(Error::TorrentDoesNotExist)?;
 
@@ -339,7 +353,6 @@ impl Daemon {
         let torrent_states = ctx.torrent_states.read().await;
 
         for state in torrent_states.values().cloned() {
-            // debug!("{state:#?}");
             sink.send(Message::TorrentState(Some(state)))
                 .await
                 .map_err(|_| Error::SendErrorTcp)?;
@@ -375,11 +388,11 @@ impl Daemon {
 
         let torrent_state = TorrentState {
             name: magnet.parse_dn(),
-            info_hash,
+            info_hash: info_hash.clone(),
             ..Default::default()
         };
 
-        torrent_states.insert(info_hash, torrent_state);
+        torrent_states.insert(info_hash.clone(), torrent_state);
         drop(torrent_states);
 
         // disk_tx is not None at this point, this is safe
@@ -389,7 +402,7 @@ impl Daemon {
 
         let mut ctxs = self.ctx.torrent_ctxs.write().await;
         ctxs.insert(info_hash, torrent.ctx.clone());
-        info!("Downloading torrent: {}", torrent.name);
+        info!("Downloading: {}", torrent.name);
 
         spawn(async move {
             if let Some(peers) = peers {

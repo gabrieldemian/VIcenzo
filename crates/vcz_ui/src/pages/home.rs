@@ -26,7 +26,8 @@ pub struct Home<'a> {
 
 impl<'a> Home<'a> {
     pub fn new(ctx: Arc<AppCtx>) -> Self {
-        let torrent_list: Box<dyn Component> = Box::new(TorrentList::new(ctx.clone()));
+        let torrent_list: Box<dyn Component> =
+            Box::new(TorrentList::new(ctx.clone()));
         let components = vec![torrent_list];
 
         Self {

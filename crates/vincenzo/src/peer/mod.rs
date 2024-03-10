@@ -6,7 +6,10 @@ use bitvec::{
 };
 use futures::{SinkExt, StreamExt};
 use hashbrown::{HashMap, HashSet};
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
+use speedy::{Readable, Writable};
+use std::{
+    collections::VecDeque, net::SocketAddr, ops::{Deref, DerefMut}, sync::Arc, time::Duration
+};
 use tokio::{
     select, sync::{
         mpsc::{self, Receiver}, oneshot, RwLock
@@ -20,10 +23,32 @@ use tracing::{debug, info, warn};
 use crate::{
     bitfield::{Bitfield, Reserved}, disk::DiskMsg, error::Error, extension::{Extension, Metadata}, peer::session::ConnectionState, tcp_wire::{
         messages::{Handshake, HandshakeCodec, Message, MessageId, PeerCodec}, Block, BlockInfo, BLOCK_LEN
-    }, torrent::{TorrentCtx, TorrentMsg}
+    }, torrent::{InfoHash, TorrentCtx, TorrentMsg}
 };
 
 use self::session::Session;
+
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Writable, Readable)]
+pub struct PeerId(pub [u8; 20]);
+
+impl Deref for PeerId {
+    type Target = [u8; 20];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for PeerId {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<[u8; 20]> for PeerId {
+    fn from(value: [u8; 20]) -> Self {
+        Self(value)
+    }
+}
 
 /// Determines who initiated the connection.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -109,13 +134,13 @@ pub struct PeerCtx {
     pub pieces: RwLock<Bitfield>,
     /// Updated when the peer sends us its peer
     /// id, in the handshake.
-    pub id: [u8; 20],
+    pub id: PeerId,
     /// Where the TCP socket of this Peer is connected to.
     pub remote_addr: SocketAddr,
     /// Where the TCP socket of this Peer is listening.
     pub local_addr: SocketAddr,
     /// The info_hash of the torrent that this Peer belongs to.
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
 }
 
 impl Peer {
@@ -132,8 +157,8 @@ impl Peer {
     pub async fn handshake(
         socket: TcpStream,
         direction: Direction,
-        info_hash: [u8; 20],
-        local_peer_id: [u8; 20],
+        info_hash: InfoHash,
+        local_peer_id: PeerId,
     ) -> Result<(Framed<TcpStream, PeerCodec>, Handshake), Error> {
         let local = socket.local_addr()?;
         let remote = socket.peer_addr()?;
@@ -302,7 +327,10 @@ impl Peer {
         let _ = self
             .torrent_ctx
             .tx
-            .send(TorrentMsg::PeerConnected(self.ctx.id, self.ctx.clone()))
+            .send(TorrentMsg::PeerConnected(
+                self.ctx.id.clone(),
+                self.ctx.clone(),
+            ))
             .await;
 
         loop {
@@ -477,7 +505,7 @@ impl Peer {
                                     DiskMsg::ReadBlock {
                                         block_info,
                                         recipient: tx,
-                                        info_hash: self.torrent_ctx.info_hash,
+                                        info_hash: self.torrent_ctx.info_hash.clone(),
                                     }
                                 )
                                 .await?;
@@ -579,7 +607,7 @@ impl Peer {
 
                                             self.torrent_ctx.tx.send(TorrentMsg::DownloadedInfoPiece(t, metadata.piece, info)).await?;
                                             self.torrent_ctx.tx.send(TorrentMsg::SendCancelMetadata{
-                                                from: self.ctx.id,
+                                                from: self.ctx.id.clone(),
                                                 index: metadata.piece
                                             })
                                             .await?;
@@ -734,15 +762,15 @@ impl Peer {
             && have_capacity
             && !self.session.seed_only;
 
-        debug!(
-            "{remote} can_request {result}
-            am_interested {am_interested}
-            am_choking {am_choking}
-            have_info {}
-            have_capacity {have_capacity}
-            seed_only {} ",
-            have_info, self.session.seed_only,
-        );
+        // debug!(
+        //     "{remote} can_request {result}
+        //     am_interested {am_interested}
+        //     am_choking {am_choking}
+        //     have_info {}
+        //     have_capacity {have_capacity}
+        //     seed_only {} ",
+        //     have_info, self.session.seed_only,
+        // );
 
         result
     }
@@ -766,7 +794,7 @@ impl Peer {
 
         // if in endgame, send cancels to all other peers
         if self.session.in_endgame {
-            let from = self.ctx.id;
+            let from = self.ctx.id.clone();
             let _ = self
                 .torrent_ctx
                 .tx
@@ -782,7 +810,7 @@ impl Peer {
             .send(DiskMsg::WriteBlock {
                 block,
                 // recipient: tx,
-                info_hash: self.torrent_ctx.info_hash,
+                info_hash: self.torrent_ctx.info_hash.clone(),
             })
             .await?;
 
@@ -806,6 +834,8 @@ impl Peer {
         if self.can_request().await {
             self.request_block_infos(sink).await?;
             self.check_request_timeout(sink).await?;
+        } else {
+            self.try_request_info(sink).await?;
         }
 
         self.session.counters.reset();
@@ -879,7 +909,7 @@ impl Peer {
                 .torrent_ctx
                 .disk_tx
                 .send(DiskMsg::ReturnBlockInfos(
-                    self.torrent_ctx.info_hash,
+                    self.torrent_ctx.info_hash.clone(),
                     blocks,
                 ))
                 .await;
@@ -930,8 +960,8 @@ impl Peer {
                 .send(DiskMsg::RequestBlocks {
                     recipient: otx,
                     qnt: request_len,
-                    info_hash: self.torrent_ctx.info_hash,
-                    peer_id: self.ctx.id,
+                    info_hash: self.torrent_ctx.info_hash.clone(),
+                    peer_id: self.ctx.id.clone(),
                 })
                 .await;
 
@@ -981,7 +1011,7 @@ impl Peer {
         let _ = self
             .torrent_ctx
             .tx
-            .send(TorrentMsg::StartEndgame(self.ctx.id, outgoing))
+            .send(TorrentMsg::StartEndgame(self.ctx.id.clone(), outgoing))
             .await;
     }
 

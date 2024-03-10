@@ -11,7 +11,7 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::{
-    error::Error, metainfo, peer::PeerCtx, tcp_wire::{Block, BlockInfo}, torrent::{TorrentCtx, TorrentMsg}
+    error::Error, metainfo, peer::{PeerCtx, PeerId}, tcp_wire::{Block, BlockInfo}, torrent::{InfoHash, TorrentCtx, TorrentMsg}
 };
 
 #[derive(Debug)]
@@ -25,7 +25,7 @@ pub enum DiskMsg {
     /// to add the peer context.
     NewPeer(Arc<PeerCtx>),
     ReadBlock {
-        info_hash: [u8; 20],
+        info_hash: InfoHash,
         block_info: BlockInfo,
         recipient: Sender<Vec<u8>>,
     },
@@ -34,7 +34,7 @@ pub enum DiskMsg {
     /// the fn will send a Have msg to all peers that don't have this piece.
     /// and update the bitfield of the Torrent struct.
     ValidatePiece {
-        info_hash: [u8; 20],
+        info_hash: InfoHash,
         recipient: Sender<Result<(), Error>>,
         piece: usize,
     },
@@ -42,21 +42,21 @@ pub enum DiskMsg {
     /// Write the given block to disk, the Disk struct will get the seeked file
     /// automatically.
     WriteBlock {
-        info_hash: [u8; 20],
+        info_hash: InfoHash,
         block: Block,
     },
     /// Request block infos that the peer has, that we do not have ir nor
     /// requested it.
     RequestBlocks {
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
+        info_hash: InfoHash,
+        peer_id: PeerId,
         recipient: Sender<VecDeque<BlockInfo>>,
         qnt: usize,
     },
     /// When a peer is Choked, or receives an error and must close the
     /// connection, the outgoing/pending blocks of this peer must be
     /// appended back to the list of available block_infos.
-    ReturnBlockInfos([u8; 20], VecDeque<BlockInfo>),
+    ReturnBlockInfos(InfoHash, VecDeque<BlockInfo>),
     Quit,
 }
 
@@ -76,7 +76,7 @@ pub enum PieceStrategy {
     Sequential,
 }
 
-// A metainfo file, but the length is accumulated.
+/// A metainfo file, but the length is accumulated.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct DiskFile {
     path: Vec<String>,
@@ -101,31 +101,22 @@ struct TorrentInfo {
 /// - Validate hash of pieces
 #[derive(Debug)]
 pub struct Disk {
-    /// k: info_hash
-    pub torrent_ctxs: HashMap<[u8; 20], Arc<TorrentCtx>>,
-    /// k: peer_id
-    pub peer_ctxs: HashMap<[u8; 20], Arc<PeerCtx>>,
-    /// k: info_hash
+    pub torrent_ctxs: HashMap<InfoHash, Arc<TorrentCtx>>,
+    pub peer_ctxs: HashMap<PeerId, Arc<PeerCtx>>,
     /// The sequence in which pieces will be downloaded,
     /// based on `PieceOrder`.
-    /// k: info_hash
-    pub pieces: HashMap<[u8; 20], Vec<u32>>,
+    pub pieces: HashMap<InfoHash, Vec<u32>>,
     /// How many pieces were downloaded.
-    /// k: info_hash
-    pub downloaded_pieces_len: HashMap<[u8; 20], u32>,
+    pub downloaded_pieces_len: HashMap<InfoHash, u32>,
     /// How many bytes downloaded for each piece.
-    /// k: info_hash
-    pub downloaded_pieces: HashMap<[u8; 20], Vec<u64>>,
-    /// k: info_hash
-    pub piece_strategy: HashMap<[u8; 20], PieceStrategy>,
+    pub downloaded_pieces: HashMap<InfoHash, Vec<u64>>,
+    pub piece_strategy: HashMap<InfoHash, PieceStrategy>,
     pub download_dir: String,
-    cache: HashMap<[u8; 20], Vec<Vec<Block>>>,
-    /// k: info_hash
-    torrent_info: HashMap<[u8; 20], TorrentInfo>,
+    cache: HashMap<InfoHash, Vec<Vec<Block>>>,
+    torrent_info: HashMap<InfoHash, TorrentInfo>,
     /// The block infos of each piece of a torrent, ordered from 0 to last.
     /// where the index of the VecDeque is a piece.
-    /// k: info_hash
-    pieces_blocks: HashMap<[u8; 20], Vec<VecDeque<BlockInfo>>>,
+    pieces_blocks: HashMap<InfoHash, Vec<VecDeque<BlockInfo>>>,
     rx: Receiver<DiskMsg>,
 }
 
@@ -148,7 +139,6 @@ impl Disk {
 
     #[tracing::instrument(skip(self), name = "disk::run")]
     pub async fn run(&mut self) -> Result<(), Error> {
-        debug!("disk started event loop");
         while let Some(msg) = self.rx.recv().await {
             match msg {
                 DiskMsg::NewTorrent(torrent) => {
@@ -160,7 +150,7 @@ impl Disk {
 
                     let len = block_info.len;
 
-                    let bytes = self.read_block(info_hash, block_info).await?;
+                    let bytes = self.read_block(&info_hash, block_info).await?;
                     let _ = recipient.send(bytes);
 
                     // increment uploaded count
@@ -169,7 +159,7 @@ impl Disk {
                 }
                 DiskMsg::WriteBlock { block, info_hash } => {
                     debug!("WriteBlock");
-                    self.write_block(info_hash, block).await?;
+                    self.write_block(&info_hash, block).await?;
                 }
                 DiskMsg::OpenFile(path, tx) => {
                     debug!("OpenFile");
@@ -184,7 +174,7 @@ impl Disk {
                 } => {
                     debug!("RequestBlocks");
                     let infos = self
-                        .request_blocks(info_hash, peer_id, qnt)
+                        .request_blocks(&info_hash, &peer_id, qnt)
                         .await
                         .unwrap_or_default();
                     debug!("disk sending {}", infos.len());
@@ -192,7 +182,7 @@ impl Disk {
                 }
                 DiskMsg::ValidatePiece { info_hash, recipient, piece } => {
                     debug!("ValidatePiece");
-                    let r = self.validate_piece(info_hash, piece).await;
+                    let r = self.validate_piece(&info_hash, piece).await;
                     let _ = recipient.send(r);
                 }
                 DiskMsg::NewPeer(peer) => {
@@ -233,12 +223,12 @@ impl Disk {
         &mut self,
         torrent_ctx: Arc<TorrentCtx>,
     ) -> Result<(), Error> {
-        let info_hash = torrent_ctx.info_hash;
+        let info_hash = &torrent_ctx.info_hash;
         debug!("new_torrent {info_hash:?}");
 
-        self.torrent_ctxs.insert(info_hash, torrent_ctx);
+        self.torrent_ctxs.insert(info_hash.clone(), torrent_ctx.clone());
 
-        let torrent_ctx = self.torrent_ctxs.get(&info_hash).unwrap();
+        let torrent_ctx = self.torrent_ctxs.get(info_hash).unwrap();
         let info = torrent_ctx.info.read().await;
 
         let mut disk_files = Vec::new();
@@ -262,7 +252,7 @@ impl Disk {
         }
 
         self.torrent_info.insert(
-            info_hash,
+            info_hash.clone(),
             TorrentInfo {
                 name: info.name.clone(),
                 total_size: info.get_size(),
@@ -272,7 +262,7 @@ impl Disk {
             },
         );
 
-        let base = self.base_path(info_hash);
+        let base = self.base_path(&info_hash);
 
         // create "skeleton" of the torrent, empty files and directories
         if let Some(files) = info.files.clone() {
@@ -300,8 +290,8 @@ impl Disk {
 
         let pieces_len = info.pieces();
 
-        self.piece_strategy.insert(info_hash, PieceStrategy::default());
-        let piece_order = self.piece_strategy.get(&info_hash).cloned().unwrap();
+        self.piece_strategy.insert(info_hash.clone(), PieceStrategy::default());
+        let piece_order = self.piece_strategy.get(info_hash).cloned().unwrap();
 
         let mut r: Vec<u32> = (0..pieces_len).collect();
         let downloaded_pieces = vec![0; pieces_len as usize];
@@ -313,12 +303,12 @@ impl Disk {
         // each index of Vec is a piece index, that is a VecDeque of blocks
         let mut pieces_blocks: Vec<VecDeque<BlockInfo>> =
             Vec::with_capacity(r.len());
-        self.pieces.insert(info_hash, r);
+        self.pieces.insert(info_hash.clone(), r);
 
         let cache_vec = vec![Vec::new(); pieces_len as usize];
-        self.cache.insert(info_hash, cache_vec);
+        self.cache.insert(info_hash.clone(), cache_vec);
 
-        self.downloaded_pieces.insert(info_hash, downloaded_pieces);
+        self.downloaded_pieces.insert(info_hash.clone(), downloaded_pieces);
 
         // generate all block_infos of this torrent
         for block in info.get_block_infos()? {
@@ -333,8 +323,8 @@ impl Disk {
                 }
             };
         }
-        self.pieces_blocks.insert(info_hash, pieces_blocks);
-        self.downloaded_pieces_len.insert(info_hash, 0);
+        self.pieces_blocks.insert(info_hash.clone(), pieces_blocks);
+        self.downloaded_pieces_len.insert(info_hash.clone(), 0);
         Ok(())
     }
 
@@ -343,7 +333,7 @@ impl Disk {
         &mut self,
         peer_ctx: Arc<PeerCtx>,
     ) -> Result<(), Error> {
-        self.peer_ctxs.insert(peer_ctx.id, peer_ctx);
+        self.peer_ctxs.insert(peer_ctx.id.clone(), peer_ctx);
         Ok(())
     }
 
@@ -359,15 +349,15 @@ impl Disk {
     /// return None.
     async fn next_piece(
         &self,
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
+        info_hash: &InfoHash,
+        peer_id: &PeerId,
     ) -> Option<(usize, u32)> {
-        let peer_ctx = self.peer_ctxs.get(&peer_id);
+        let peer_ctx = self.peer_ctxs.get(peer_id);
         peer_ctx?;
         let peer_pieces = peer_ctx.unwrap().pieces.read().await;
-        let downloaded_pieces = self.downloaded_pieces.get(&info_hash).unwrap();
+        let downloaded_pieces = self.downloaded_pieces.get(info_hash).unwrap();
         self.pieces
-            .get(&info_hash)
+            .get(info_hash)
             .unwrap()
             .iter()
             .enumerate()
@@ -395,12 +385,15 @@ impl Disk {
     /// The function will get the pieces of all peers, and see
     /// which pieces are the most rare, and reorder the piece
     /// vector of Disk, where the most rare are the ones to the right.
-    async fn rarest_first(&mut self, info_hash: [u8; 20]) -> Result<(), Error> {
+    async fn rarest_first(
+        &mut self,
+        info_hash: &InfoHash,
+    ) -> Result<(), Error> {
         // get all peers of the given torrent `info_hash`
         let peer_ctxs: Vec<Arc<PeerCtx>> = self
             .peer_ctxs
             .values()
-            .filter(|&v| v.info_hash == info_hash)
+            .filter(|&v| v.info_hash == *info_hash)
             .cloned()
             .collect();
 
@@ -411,10 +404,8 @@ impl Disk {
         }
 
         // pieces of the local peer
-        let pieces = self
-            .pieces
-            .get_mut(&info_hash)
-            .ok_or(Error::TorrentDoesNotExist)?;
+        let pieces =
+            self.pieces.get_mut(info_hash).ok_or(Error::TorrentDoesNotExist)?;
 
         // vec of pieces scores/occurences, where index = piece.
         let mut score: Vec<u32> = vec![0u32; pieces.len()];
@@ -451,7 +442,7 @@ impl Disk {
         }
 
         debug!("pieces changed to rarest {pieces:?}");
-        let piece_order = self.piece_strategy.get_mut(&info_hash).unwrap();
+        let piece_order = self.piece_strategy.get_mut(info_hash).unwrap();
         if *piece_order == PieceStrategy::Random {
             *piece_order = PieceStrategy::Rarest;
         }
@@ -464,8 +455,8 @@ impl Disk {
     #[tracing::instrument(skip_all)]
     pub async fn request_blocks(
         &mut self,
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
+        info_hash: &InfoHash,
+        peer_id: &PeerId,
         qnt: usize,
     ) -> Result<VecDeque<BlockInfo>, Error> {
         let mut result: VecDeque<BlockInfo> = VecDeque::new();
@@ -475,7 +466,7 @@ impl Disk {
 
             if let Some(piece) = next_piece {
                 let pieces_blocks =
-                    self.pieces_blocks.get_mut(&info_hash).unwrap();
+                    self.pieces_blocks.get_mut(info_hash).unwrap();
                 let blocks = pieces_blocks.get_mut(piece.1 as usize);
 
                 if let Some(blocks) = blocks {
@@ -485,10 +476,7 @@ impl Disk {
                             piece.1, piece.0
                         );
                         // pieces_blocks.remove(piece.1 as usize);
-                        self.pieces
-                            .get_mut(&info_hash)
-                            .unwrap()
-                            .remove(piece.0);
+                        self.pieces.get_mut(info_hash).unwrap().remove(piece.0);
                     }
                     // how many blocks are left to request
                     let left = qnt - result.len();
@@ -525,7 +513,7 @@ impl Disk {
 
     pub async fn read_block(
         &self,
-        info_hash: [u8; 20],
+        info_hash: &InfoHash,
         block_info: BlockInfo,
     ) -> Result<Vec<u8>, Error> {
         let mut file =
@@ -556,7 +544,7 @@ impl Disk {
     #[tracing::instrument(skip(self, block))]
     pub async fn write_block(
         &mut self,
-        info_hash: [u8; 20],
+        info_hash: &InfoHash,
         block: Block,
     ) -> Result<(), Error> {
         // Write the block's data to the correct position in the file
@@ -565,14 +553,13 @@ impl Disk {
 
         let torrent_ctx = self
             .torrent_ctxs
-            .get(&info_hash)
+            .get(info_hash)
             .ok_or(Error::TorrentDoesNotExist)?
             .clone();
 
         let torrent_tx = torrent_ctx.tx.clone();
 
-        self.cache.get_mut(&info_hash).ok_or(Error::TorrentDoesNotExist)?
-            [index]
+        self.cache.get_mut(info_hash).ok_or(Error::TorrentDoesNotExist)?[index]
             .push(block);
 
         let _ =
@@ -580,7 +567,7 @@ impl Disk {
 
         let downloaded_piece_bytes = self
             .downloaded_pieces
-            .get_mut(&info_hash)
+            .get_mut(info_hash)
             .ok_or(Error::TorrentDoesNotExist)?
             .get_mut(index)
             .unwrap();
@@ -591,7 +578,7 @@ impl Disk {
         if *downloaded_piece_bytes >= self.piece_size(info_hash, index) as u64 {
             let downloaded_pieces_len = self
                 .downloaded_pieces_len
-                .get_mut(&info_hash)
+                .get_mut(info_hash)
                 .ok_or(Error::TorrentDoesNotExist)?;
 
             *downloaded_pieces_len += 1;
@@ -599,7 +586,7 @@ impl Disk {
             if *downloaded_pieces_len == 1 {
                 let piece_order = self
                     .piece_strategy
-                    .get(&info_hash)
+                    .get(info_hash)
                     .ok_or(Error::TorrentDoesNotExist)?;
 
                 if *piece_order == PieceStrategy::Random {
@@ -630,7 +617,7 @@ impl Disk {
             // at this point the piece is valid,
             // get the file path of all the blocks,
             // and then write all bytes into the files.
-            self.write_pieces(info_hash, index).await?;
+            self.write_pieces(&info_hash, index).await?;
         }
 
         Ok(())
@@ -648,10 +635,10 @@ impl Disk {
     pub async fn get_file_from_block_info(
         &self,
         block_info: &BlockInfo,
-        info_hash: [u8; 20],
+        info_hash: &InfoHash,
     ) -> Result<(File, metainfo::File), Error> {
         let torrent =
-            self.torrent_ctxs.get(&info_hash).ok_or(Error::InfoHashInvalid)?;
+            self.torrent_ctxs.get(info_hash).ok_or(Error::InfoHashInvalid)?;
 
         let info = torrent.info.read().await;
 
@@ -701,7 +688,7 @@ impl Disk {
     pub async fn get_file_from_piece(
         &self,
         piece: u32,
-        info_hash: [u8; 20],
+        info_hash: InfoHash,
     ) -> Result<metainfo::File, Error> {
         let torrent =
             self.torrent_ctxs.get(&info_hash).ok_or(Error::InfoHashInvalid)?;
@@ -737,7 +724,7 @@ impl Disk {
     pub async fn get_block_from_block_info(
         &self,
         block_info: &BlockInfo,
-        info_hash: [u8; 20],
+        info_hash: &InfoHash,
     ) -> Result<Block, Error> {
         // todo: try to get the block from cache first,
         // if not in cache, read from disk.
@@ -765,27 +752,21 @@ impl Disk {
     #[tracing::instrument(skip(self, info_hash))]
     pub async fn validate_piece(
         &self,
-        info_hash: [u8; 20],
+        info_hash: &InfoHash,
         index: usize,
     ) -> Result<(), Error> {
         let b = index * 20;
         let e = b + 20;
 
-        let pieces = &self
-            .torrent_ctxs
-            .get(&info_hash)
-            .unwrap()
-            .info
-            .read()
-            .await
-            .pieces;
+        let pieces =
+            &self.torrent_ctxs.get(info_hash).unwrap().info.read().await.pieces;
 
         let hash_from_info = pieces[b..e].to_owned();
 
         let mut hash = sha1_smol::Sha1::new();
 
         let mut blocks: Vec<Block> =
-            self.cache.get(&info_hash).unwrap()[index].clone();
+            self.cache.get(info_hash).unwrap()[index].clone();
         blocks.sort();
 
         for block in &blocks {
@@ -805,15 +786,15 @@ impl Disk {
     /// It will free the blocks in the cache.
     async fn write_pieces(
         &mut self,
-        info_hash: [u8; 20],
+        info_hash: &InfoHash,
         piece: usize,
     ) -> Result<(), Error> {
         let mut blocks: Vec<Block> =
-            self.cache.get_mut(&info_hash).unwrap()[piece].drain(..).collect();
+            self.cache.get_mut(info_hash).unwrap()[piece].drain(..).collect();
 
         blocks.sort();
 
-        let torrent_info = self.torrent_info.get(&info_hash).unwrap();
+        let torrent_info = self.torrent_info.get(info_hash).unwrap();
         let files = &torrent_info.files;
         let piece_length = torrent_info.piece_length as u64;
         let piece_offset = piece as u64 * piece_length;
@@ -886,8 +867,8 @@ impl Disk {
     }
     /// Get the correct piece size, the last piece of a torrent
     /// might be smaller than the other pieces.
-    fn piece_size(&self, info_hash: [u8; 20], piece_index: usize) -> u32 {
-        let v = self.torrent_info.get(&info_hash).unwrap();
+    fn piece_size(&self, info_hash: &InfoHash, piece_index: usize) -> u32 {
+        let v = self.torrent_info.get(info_hash).unwrap();
         if piece_index == v.pieces as usize - 1 {
             let remainder = v.total_size % v.piece_length as u64;
             if remainder == 0 {
@@ -901,8 +882,8 @@ impl Disk {
     }
     /// Get the base path of a torrent directory.
     /// Which is always "download_dir/name_of_torrent".
-    pub fn base_path(&self, info_hash: [u8; 20]) -> PathBuf {
-        let info = self.torrent_info.get(&info_hash).unwrap();
+    pub fn base_path(&self, info_hash: &InfoHash) -> PathBuf {
+        let info = self.torrent_info.get(info_hash).unwrap();
         let mut base = PathBuf::from(&self.download_dir);
         base.push(&info.name);
         base
@@ -911,12 +892,10 @@ impl Disk {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use rand::{distributions::Alphanumeric, Rng};
 
     use crate::{
-        bitfield::Bitfield, daemon::DaemonMsg, magnet::Magnet, metainfo::{self, Info}, tcp_wire::{Block, BLOCK_LEN}, torrent::Torrent
+        bitfield::Bitfield, daemon::DaemonMsg, magnet::Magnet, metainfo::Info, tcp_wire::BLOCK_LEN, torrent::Torrent
     };
 
     use super::*;
@@ -974,7 +953,8 @@ mod tests {
             ]),
         };
 
-        disk.torrent_ctxs.insert(torrent_ctx.info_hash, torrent_ctx.clone());
+        disk.torrent_ctxs
+            .insert(torrent_ctx.info_hash.clone(), torrent_ctx.clone());
 
         let mut info_ctx = torrent.ctx.info.write().await;
         *info_ctx = info.clone();
@@ -1058,14 +1038,14 @@ mod tests {
         let magnet = Magnet::new(&magnet).unwrap();
         let torrent = Torrent::new(disk_tx.clone(), fr_tx, magnet);
         let torrent_ctx = torrent.ctx.clone();
-        let info_hash: [u8; 20] = torrent_ctx.info_hash;
+        let info_hash = &torrent_ctx.info_hash;
         let mut disk = Disk::new(disk_rx, download_dir.clone());
 
         let mut info_ctx = torrent.ctx.info.write().await;
         *info_ctx = info.clone();
         drop(info_ctx);
 
-        disk.new_torrent(torrent_ctx).await.unwrap();
+        disk.new_torrent(torrent_ctx.clone()).await.unwrap();
 
         // write 0s to all files with their sizes
         for file in &info.files.clone().unwrap() {
@@ -1111,8 +1091,10 @@ mod tests {
         // first block of second file
         let block = BlockInfo { index: 25, begin: 169760, len: BLOCK_LEN };
 
-        let (_, meta_file) =
-            disk.get_file_from_block_info(&block, info_hash).await.unwrap();
+        let (_, meta_file) = disk
+            .get_file_from_block_info(&block, info_hash)
+            .await
+            .unwrap();
 
         assert_eq!(meta_file, info.files.as_ref().unwrap()[1]);
 
@@ -1120,24 +1102,30 @@ mod tests {
         let block =
             BlockInfo { index: 25, begin: 169760 + BLOCK_LEN, len: BLOCK_LEN };
 
-        let (_, meta_file) =
-            disk.get_file_from_block_info(&block, info_hash).await.unwrap();
+        let (_, meta_file) = disk
+            .get_file_from_block_info(&block, info_hash)
+            .await
+            .unwrap();
 
         assert_eq!(meta_file, info.files.as_ref().unwrap()[1]);
 
         // last of second file
         let block = BlockInfo { index: 33, begin: 49152, len: 13625 };
 
-        let (_, meta_file) =
-            disk.get_file_from_block_info(&block, info_hash).await.unwrap();
+        let (_, meta_file) = disk
+            .get_file_from_block_info(&block, info_hash)
+            .await
+            .unwrap();
 
         assert_eq!(meta_file, info.files.as_ref().unwrap()[1]);
 
         // last file of torrent
         let block = BlockInfo { index: 33, begin: 62777, len: 46 };
 
-        let (_, meta_file) =
-            disk.get_file_from_block_info(&block, info_hash).await.unwrap();
+        let (_, meta_file) = disk
+            .get_file_from_block_info(&block, info_hash)
+            .await
+            .unwrap();
 
         assert_eq!(meta_file, info.files.as_ref().unwrap()[2]);
 
@@ -1183,7 +1171,7 @@ mod tests {
         let (fr_tx, _) = mpsc::channel::<DaemonMsg>(300);
         let magnet = Magnet::new(&magnet).unwrap();
         let torrent = Torrent::new(disk_tx, fr_tx, magnet);
-        let info_hash = torrent.ctx.info_hash;
+        let info_hash = &torrent.ctx.info_hash;
 
         let mut info_t = torrent.ctx.info.write().await;
         *info_t = info.clone();
@@ -1191,7 +1179,7 @@ mod tests {
 
         disk.new_torrent(torrent.ctx.clone()).await.unwrap();
 
-        *disk.piece_strategy.get_mut(&info_hash).unwrap() =
+        *disk.piece_strategy.get_mut(info_hash).unwrap() =
             PieceStrategy::Sequential;
 
         let mut p = torrent.ctx.bitfield.write().await;
@@ -1303,8 +1291,8 @@ mod tests {
 
         disk.new_torrent(torrent.ctx.clone()).await.unwrap();
 
-        let info_hash = torrent.ctx.info_hash;
-        *disk.piece_strategy.get_mut(&info_hash).unwrap() =
+        let info_hash = &torrent.ctx.info_hash;
+        *disk.piece_strategy.get_mut(info_hash).unwrap() =
             PieceStrategy::Sequential;
 
         let mut p = torrent.ctx.bitfield.write().await;
@@ -1457,8 +1445,8 @@ mod tests {
 
         disk.new_torrent(torrent.ctx.clone()).await.unwrap();
 
-        let info_hash = torrent.ctx.info_hash;
-        *disk.piece_strategy.get_mut(&info_hash).unwrap() =
+        let info_hash = &torrent.ctx.info_hash;
+        *disk.piece_strategy.get_mut(info_hash).unwrap() =
             PieceStrategy::Sequential;
 
         let mut p = torrent.ctx.bitfield.write().await;

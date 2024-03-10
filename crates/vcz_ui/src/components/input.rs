@@ -146,8 +146,8 @@ impl<'a> Component for Input<'a> {
                 Style::default(),
             ),
         };
-        let mut text = Text::from(Line::from(msg));
-        text.patch_style(style);
+        let text = Text::from(Line::from(msg));
+        let text = text.patch_style(style);
         let help_message = Paragraph::new(text);
 
         // render help message

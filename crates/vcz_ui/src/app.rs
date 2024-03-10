@@ -5,7 +5,7 @@ use futures::{stream::SplitStream, SinkExt, StreamExt};
 use tokio_util::codec::Framed;
 use tracing::debug;
 
-use std::{net::SocketAddr, sync::Arc, marker::PhantomData};
+use std::{marker::PhantomData, net::SocketAddr, sync::Arc};
 use tokio::{
     net::TcpStream, select, spawn, sync::mpsc::{self, unbounded_channel}
 };
@@ -52,11 +52,11 @@ impl<'a> App<'a> {
     /// when we receive a message, we send it to ourselves
     /// via mpsc [`Action`]. For example, when we receive
     /// a Draw message from the daemon, we send a Draw message to `run`
+    #[tracing::instrument(skip_all)]
     pub async fn listen_daemon(
         app_tx: mpsc::UnboundedSender<Action>,
         mut sink: SplitStream<Framed<TcpStream, DaemonCodec>>,
     ) -> Result<(), Error> {
-        debug!("ui listen_daemon");
         loop {
             select! {
                 Some(Ok(msg)) = sink.next() => {
@@ -65,7 +65,6 @@ impl<'a> App<'a> {
                             let _ = app_tx.send(Action::TorrentState(state));
                         }
                         Message::Quit => {
-                            debug!("ui Quit");
                             let _ = app_tx.send(Action::Quit);
                             break;
                         }
@@ -89,7 +88,7 @@ impl<'a> App<'a> {
 
         let socket = TcpStream::connect(daemon_addr).await.unwrap();
 
-        debug!("ui connected to daemon on {:?}", socket.local_addr());
+        debug!("connected to daemon on {:?}", socket.local_addr().unwrap());
 
         let socket = Framed::new(socket, DaemonCodec);
         let (mut sink, stream) = socket.split();

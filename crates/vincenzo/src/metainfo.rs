@@ -117,7 +117,7 @@ impl Info {
             return f as u64;
         }
 
-        warn!("tried to call get_size of malformed Info {self:#?}");
+        // warn!("tried to call get_size of malformed Info");
         0
     }
 

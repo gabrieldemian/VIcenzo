@@ -3,7 +3,7 @@ use std::ops::{Deref, DerefMut};
 
 use magnet_url::Magnet as Magnet_;
 
-use crate::error::Error;
+use crate::{error::Error, torrent::InfoHash};
 
 #[derive(Debug, Clone, Hash)]
 pub struct Magnet(Magnet_);
@@ -39,12 +39,12 @@ impl Magnet {
     }
 
     /// Transform the "xt" field from hex, to a slice.
-    pub fn parse_xt(&self) -> [u8; 20] {
+    pub fn parse_xt(&self) -> InfoHash {
         let info_hash = hex::decode(self.xt.clone().unwrap()).unwrap();
         let mut x = [0u8; 20];
 
         x[..20].copy_from_slice(&info_hash[..20]);
-        x
+        InfoHash(x)
     }
 
     /// Parse trackers so they can be used as socket addresses.

@@ -5,7 +5,7 @@ use tokio::io;
 use tokio_util::codec::{Decoder, Encoder};
 use tracing::{trace, warn};
 
-use crate::{bitfield::Bitfield, error::Error};
+use crate::{bitfield::Bitfield, error::Error, peer::PeerId, torrent::InfoHash};
 
 use super::{Block, BlockInfo, PSTR};
 
@@ -294,8 +294,8 @@ impl Encoder<Handshake> for HandshakeCodec {
         // payload
         buf.extend_from_slice(&pstr);
         buf.extend_from_slice(&reserved);
-        buf.extend_from_slice(&info_hash);
-        buf.extend_from_slice(&peer_id);
+        buf.extend_from_slice(&*info_hash);
+        buf.extend_from_slice(&*peer_id);
 
         Ok(())
     }
@@ -353,8 +353,8 @@ impl Decoder for HandshakeCodec {
             pstr,
             pstr_len: pstr.len() as u8,
             reserved,
-            info_hash,
-            peer_id,
+            info_hash: info_hash.into(),
+            peer_id: peer_id.into(),
         }))
     }
 }
@@ -371,12 +371,12 @@ pub struct Handshake {
     pub pstr_len: u8,
     pub pstr: [u8; 19],
     pub reserved: [u8; 8],
-    pub info_hash: [u8; 20],
-    pub peer_id: [u8; 20],
+    pub info_hash: InfoHash,
+    pub peer_id: PeerId,
 }
 
 impl Handshake {
-    pub fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+    pub fn new(info_hash: InfoHash, peer_id: PeerId) -> Self {
         let mut reserved = [0u8; 8];
 
         // we support the `extension protocol`
@@ -562,8 +562,8 @@ mod tests {
 
     #[test]
     fn handshake() {
-        let info_hash = [5u8; 20];
-        let peer_id = [7u8; 20];
+        let info_hash = [5u8; 20].into();
+        let peer_id = [7u8; 20].into();
         let our_handshake = Handshake::new(info_hash, peer_id);
 
         assert_eq!(our_handshake.pstr_len, 19);
